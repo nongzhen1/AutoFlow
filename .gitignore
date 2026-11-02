@@ -1,0 +1,42 @@
+.env
+state/
+logs/
+output/
+proxy/config.yaml
+host_password.txt
+*.bak-*
+*.tar.gz
+
+app/.im_sdk_cache/
+app/logs/
+app/*.log
+app/usersData.json
+app/webui_settings.json
+app/im_client_introspect.mjs
+app/core/protocol_sender_debug.mjs
+app/**/__pycache__/
+app/**/*.pyc
+app/config.json
+
+.migration-backups/
+app/webui_users.json
+app/*.lock
+# >>> Comet managed project state >>>
+!/.comet/
+/.comet/*
+!/.comet/config.yaml
+# <<< Comet managed project state <<<
+.data-backups/
+
+# Server-local runtime backups and pre-theme backups (never committed)
+/backups/
+app/.theme-backup-*/
+
+# Vendored archives are not tracked; add them as build/CI downloads instead.
+*.whl
+app/webui/static/*.zip
+
+# Local-only launchers and notes
+/start-web.cmd
+/start-web.ps1
+/如何打开控制台.md

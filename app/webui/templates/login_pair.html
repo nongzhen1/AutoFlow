@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cut">
+    <meta name="color-scheme" content="light dark">
+    <title>确认扫码登录 · 续火花</title>
+    <script>
+      (function () {
+        var stored = null;
+        try { stored = localStorage.getItem("autoflow-theme"); } catch (e) {}
+        document.documentElement.dataset.theme = stored === "light" || stored === "dark"
+          ? stored
+          : (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/app.css?v=20261102-2">
+  </head>
+  <body data-page="login">
+    <div class="auth auth-pair">
+      <main class="auth-main">
+        <div class="auth-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换深浅色" title="切换深浅色">
+            <i data-lucide="moon" class="theme-light-icon"></i>
+            <i data-lucide="sun" class="theme-dark-icon"></i>
+          </button>
+        </div>
+        <section class="auth-card">
+          {% if pair_status == "unauthenticated" %}
+          <h2>先登录这台设备</h2>
+          <p>确认扫码登录需要当前设备已经登录控制台。请先用密码登录，再重新扫描二维码。</p>
+          <a class="button button-primary button-block" href="/login">
+            <i data-lucide="log-in"></i><span>去登录</span>
+          </a>
+          {% elif pair_status == "invalid" %}
+          <h2>二维码无效</h2>
+          <p>二维码不存在、已被使用或已过期。请回到发起登录的设备刷新二维码后重新扫描。</p>
+          {% elif pair_status == "approved" %}
+          <h2>已确认</h2>
+          <p>这次扫码登录已经确认，请回到发起登录的设备继续。</p>
+          {% else %}
+          <h2>确认扫码登录</h2>
+          <p>有一台设备正在请求登录控制台。确认后将使用 <strong>{{ approver }}</strong> 的身份进入。</p>
+          <dl class="pair-facts">
+            <div><dt>请求设备 IP</dt><dd>{{ requester_ip or "未知" }}</dd></div>
+            <div><dt>剩余有效期</dt><dd>{{ expires_in }} 秒</dd></div>
+          </dl>
+          <form method="post" action="/login/pair" class="form-stack">
+            <input type="hidden" name="code" value="{{ pair_code }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="button button-primary button-block" type="submit">
+              <i data-lucide="badge-check"></i><span>确认登录</span>
+            </button>
+          </form>
+          <a class="button button-soft button-block" href="/">
+            <i data-lucide="x"></i><span>取消</span>
+          </a>
+          {% endif %}
+
+          {% if flash %}
+          <div class="flash flash-{{ flash.level }}" role="status">{{ flash.message }}</div>
+          {% endif %}
+
+          <p class="auth-foot">只确认你本人发起的登录请求。</p>
+        </section>
+      </main>
+    </div>
+
+    <script defer src="/static/lucide.min.js?v=20260710"></script>
+    <script defer src="/static/app.js?v=20261005-6"></script>
+  </body>
+</html>

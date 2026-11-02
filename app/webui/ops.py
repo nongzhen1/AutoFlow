@@ -1,0 +1,2121 @@
+import errno
+import json
+import hashlib
+import logging
+import os
+import re
+import shlex
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from filelock import FileLock, Timeout as FileLockTimeout
+
+from core import identity as account_identity
+from core import streak_state
+from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
+from core.tasks import (
+    TEMPORARY_ACCOUNT_FAILURE_CATEGORIES,
+    _temporary_account_failure_cooldown_minutes,
+)
+from utils.config import (
+    get_app_settings,
+    get_config,
+    get_userData,
+    repo_root,
+    update_config,
+)
+
+logger = logging.getLogger(__name__)
+
+TASK_ALREADY_RUNNING = -2
+
+# Every patrol line carries this env assignment, whichever way the task command
+# is built (container script, compose ``-e`` or a local env prefix), so the
+# panel can tell it apart from the send lines.
+PATROL_SCHEDULE_MARKER = "AUTOFLOW_TASK_MODE=patrol"
+PATROL_TRIGGER_LABEL = "account patrol"
+PATROL_LEAD_MINUTES = 30
+
+TASK_SCHEDULE_MARKERS = (
+    "docker compose run --rm task",
+    "docker compose run --rm douyin",
+    "main.py --doTask",
+    "run_scheduled_task.sh",
+    PATROL_SCHEDULE_MARKER,
+)
+HOST_CRONTAB_PATH = Path("/host-spool-cron/root")
+# The scheduler container mounts ./app/logs at /app/logs, so trigger
+# output written here stays readable from both the scheduler and the web
+# container (the panel). /var/log is not mounted and silently diverges.
+CRON_LOG_PATH = "/app/logs/autoflow.log"
+WINDOWED_SCHEDULE_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})/(\d+)m$", re.IGNORECASE)
+
+CONFIRMATION_LABELS = {
+    "cdp_message_send_receipt": "服务端回执",
+    "browser_visible_count_increased": "页面回显",
+    "protocol_send_receipt": "协议发送回执",
+    "streak_verified": "续火花已核验",
+    "legacy_sentAt_only": "旧记录待核验",
+    "manual_reset": "人工标记待核验",
+}
+
+FAILURE_CATEGORY_LABELS = {
+    "send_unconfirmed": "待核验",
+    "login_required": "登录失效",
+    "login_verification_pending": "登录态待核验",
+    "protocol_login_required": "协议登录失效",
+    "browser_login_required": "浏览器登录失效",
+    "account_identity_mismatch": "账号身份不匹配",
+    "identity_unverified": "身份暂时无法核实",
+    "network_unavailable": "网络不可用",
+    "structure_changed": "页面结构变化",
+    "empty_result": "未读到好友",
+    "friend_not_found": "未找到好友",
+    "group_not_found": "未找到群聊",
+    "group_identity_unavailable": "群聊身份无法确认",
+    "friend_list_unavailable": "好友列表不可用",
+    "timeout": "执行超时",
+    "navigation": "页面访问失败",
+    "selector": "页面结构变化",
+    "browser_crash": "浏览器异常",
+    "protocol_user_blocked": "对方限制私信",
+    "protocol_user_not_in_conversation": "不在会话中",
+    "protocol_check_message_not_pass": "消息未通过校验",
+    "protocol_check_message_self_visible": "仅自己可见（对方未收到）",
+    "protocol_check_conversation_not_pass": "会话未通过校验",
+    "protocol_send_failed": "协议发送失败",
+    "protocol_unresolved": "协议找不到会话",
+    "protocol_sender_failed": "协议发送器异常",
+}
+
+
+def running_in_container():
+    return Path("/.dockerenv").exists()
+
+
+def compose_root():
+    settings = get_app_settings()
+    raw = settings.get("compose_root") or ""
+    if raw:
+        p = Path(raw)
+        if (p / "docker-compose.yml").exists():
+            return p
+    # Docker-out-of-Docker: the compose file lives on the host at
+    # /opt/autoflow but is not always bind-mounted into /app.
+    for candidate in [
+        Path("/opt/autoflow"),
+        repo_root().parent,
+        repo_root(),
+    ]:
+        if (candidate / "docker-compose.yml").exists():
+            return candidate
+    # Fallback
+    return Path(raw) if raw else repo_root()
+
+
+def compose_file_path():
+    path = compose_root() / "docker-compose.yml"
+    return path if path.exists() else None
+
+
+def compose_command(*args):
+    compose_file = compose_file_path()
+    base = ["docker", "compose"]
+    if compose_file:
+        base.extend(["-f", str(compose_file)])
+    base.extend(args)
+    return base
+
+
+def _pid_is_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno in (errno.EPERM, errno.EACCES):
+            return True
+        if getattr(exc, "winerror", None) is not None:
+            # Windows reports an invalid or already-exited pid with a variety of
+            # winerror values (87 ERROR_INVALID_PARAMETER, 11 ERROR_BAD_FORMAT,
+            # 1168 ERROR_NOT_FOUND, ...). None of them mean the process is alive.
+            return False
+        if exc.errno == errno.ESRCH:
+            return False
+        raise
+    return True
+
+
+def _parse_lock_pid(raw):
+    text = str(raw or "").strip()
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("pid") is not None:
+        try:
+            return int(payload["pid"])
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(text.splitlines()[0])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def task_run_lock_status():
+    lock_path = repo_root() / "logs" / "task.run.lock"
+    guard = FileLock(f"{lock_path}.guard", timeout=0)
+    try:
+        guard.acquire()
+    except FileLockTimeout:
+        locked = True
+    else:
+        locked = False
+        guard.release()
+
+    if not lock_path.exists():
+        return {
+            "running": locked,
+            "path": str(lock_path),
+            "pid": None,
+            "ageSeconds": 0,
+            "stale": False,
+            "staleReason": "",
+            "staleRemoved": False,
+        }
+
+    raw = lock_path.read_text(encoding="utf-8", errors="ignore")
+    pid = _parse_lock_pid(raw)
+    try:
+        age_seconds = max(
+            0,
+            int(datetime.now(timezone.utc).timestamp() - lock_path.stat().st_mtime),
+        )
+    except OSError:
+        return {
+            "running": locked,
+            "path": str(lock_path),
+            "pid": pid,
+            "ageSeconds": 0,
+            "stale": not locked,
+            "staleReason": "lock_stat_failed" if not locked else "",
+            "staleRemoved": False,
+        }
+
+    if locked:
+        return {
+            "running": True,
+            "path": str(lock_path),
+            "pid": pid,
+            "ageSeconds": age_seconds,
+            "stale": False,
+            "staleReason": "",
+            "staleRemoved": False,
+        }
+
+    stale_reason = (
+        "owner_pid_missing"
+        if pid is not None and not _pid_is_alive(pid)
+        else "file_lock_released"
+    )
+    return {
+        "running": False,
+        "path": str(lock_path),
+        "pid": pid,
+        "ageSeconds": age_seconds,
+        "stale": True,
+        "staleReason": stale_reason,
+        "staleRemoved": False,
+    }
+
+
+def build_task_run_spec():
+    if running_in_container():
+        return [sys.executable, "main.py", "--doTask"], repo_root()
+    if compose_file_path():
+        return compose_command("run", "--rm", "task"), compose_root()
+    return [sys.executable, "main.py", "--doTask"], repo_root()
+
+
+def _env_shell_prefix(extra_env=None):
+    parts = []
+    for key, value in (extra_env or {}).items():
+        parts.append(f"{key}={shlex.quote(str(value))}")
+    return " ".join(parts)
+
+
+def _with_env_prefix(command, extra_env=None):
+    env_prefix = _env_shell_prefix(extra_env)
+    return f"env {env_prefix} {command}" if env_prefix else command
+
+
+def _compose_env_args(extra_env=None):
+    parts = []
+    for key, value in (extra_env or {}).items():
+        parts.extend(["-e", f"{key}={value}"])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def build_scheduled_task_command(extra_env=None, trigger_label="scheduled send"):
+    if running_in_container():
+        task_env = dict(extra_env or {})
+        task_env["AUTOFLOW_TRIGGER_LABEL"] = trigger_label
+        return _with_env_prefix("bash /app/scripts/run_scheduled_task.sh", task_env)
+    if compose_file_path():
+        compose_root_quoted = shlex.quote(str(compose_root()))
+        compose_env_args = _compose_env_args(extra_env)
+        compose_env_suffix = f" {compose_env_args}" if compose_env_args else ""
+        return (
+            "/bin/bash -lc "
+            f"'echo \"[AUTO_TRIGGER] $(date -Iseconds) compose {trigger_label} start\"; "
+            f"cd {compose_root_quoted} && /usr/bin/docker compose run --rm{compose_env_suffix} task'"
+        )
+    repo_root_quoted = shlex.quote(str(repo_root()))
+    python_quoted = shlex.quote(sys.executable)
+    task_command = _with_env_prefix(f"{python_quoted} main.py --doTask", extra_env)
+    return (
+        "/bin/bash -lc "
+        f"'echo \"[AUTO_TRIGGER] $(date -Iseconds) local {trigger_label} start\"; "
+        f"cd {repo_root_quoted} && {task_command}'"
+    )
+
+
+def build_unsent_fallback_task_command():
+    return build_scheduled_task_command(
+        {
+            "AUTOFLOW_MANUAL_RUN": "1",
+            "AUTOFLOW_MANUAL_UNSENT_ONLY": "1",
+            "AUTOFLOW_FALLBACK_PHASE": "1",
+            "PYTHONUNBUFFERED": "1",
+        },
+        trigger_label="unsent fallback",
+    )
+
+
+def build_patrol_task_command():
+    return build_scheduled_task_command(
+        {
+            "AUTOFLOW_TASK_MODE": "patrol",
+            "PYTHONUNBUFFERED": "1",
+        },
+        trigger_label=PATROL_TRIGGER_LABEL,
+    )
+
+
+def is_patrol_schedule_line(line):
+    return PATROL_SCHEDULE_MARKER in str(line or "")
+
+
+def patrol_time_for_schedule(schedule):
+    """(hour, minute) of the daily patrol, or None when nothing is scheduled.
+
+    The patrol runs ``PATROL_LEAD_MINUTES`` before the first scheduled send of
+    the day: the window start, or the single fixed run. A send at 00:00 puts
+    the patrol at 23:30 of the previous day.
+    """
+    if not schedule:
+        return None
+    if schedule.get("mode") == "window":
+        first_minute = int(schedule["startHour"]) * 60
+    elif schedule.get("mode") == "fixed":
+        first_minute = int(schedule["hour"]) * 60 + int(schedule["minute"])
+    else:
+        return None
+    patrol_minute = (first_minute - PATROL_LEAD_MINUTES) % (24 * 60)
+    return patrol_minute // 60, patrol_minute % 60
+
+
+def patrol_cron_line(schedule):
+    when = patrol_time_for_schedule(schedule)
+    if when is None:
+        return ""
+    hour, minute = when
+    return f"{minute} {hour} * * * {build_patrol_task_command()} >> {CRON_LOG_PATH} 2>&1"
+
+
+def run_command(args, cwd=None, timeout=120, check=False):
+    """Run a command and return the CompletedProcess.
+
+    ``check`` defaults to False so callers can inspect the result without
+    crashing when the command is unavailable (e.g. docker not installed).
+    """
+    try:
+        return subprocess.run(
+            args,
+            cwd=str(cwd or compose_root()),
+            check=check,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        # Docker and cron are optional integration points when the UI is run
+        # directly on a developer workstation (especially on Windows). A
+        # status probe must not turn their absence into a warning on every
+        # dashboard refresh.
+        logger.debug("Optional command not found: %s", args[0] if args else args)
+        return _empty_result()
+    except subprocess.TimeoutExpired:
+        logger.warning("Command timed out: %s", args)
+        return _empty_result()
+    except subprocess.CalledProcessError as exc:
+        logger.warning("Command failed (rc=%s): %s", exc.returncode, args)
+        return _empty_result(stderr=exc.stderr or "")
+
+
+def _empty_result(stdout="", stderr=""):
+    """Return a fake CompletedProcess for graceful degradation."""
+    return subprocess.CompletedProcess(args=[], returncode=1, stdout=stdout, stderr=stderr)
+
+
+def run_background_command(args, log_path, cwd=None, env=None):
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cwd_path = Path(cwd) if cwd else compose_root()
+    child_env = os.environ.copy()
+    if env:
+        child_env.update(env)
+
+    with log_path.open("ab") as handle:
+        started_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        env_keys = ",".join(sorted((env or {}).keys())) or "none"
+        handle.write(
+            (
+                f"[WEB_TRIGGER] {started_at} start cwd={cwd_path} "
+                f"env_keys={env_keys} command={shlex.join([str(part) for part in args])}\n"
+            ).encode("utf-8", errors="replace")
+        )
+        handle.flush()
+        process = subprocess.Popen(
+            args,
+            cwd=str(cwd_path),
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            env=child_env,
+        )
+        handle.write(f"[WEB_TRIGGER] {started_at} pid={process.pid}\n".encode("utf-8", errors="replace"))
+        handle.flush()
+    return process.pid
+
+
+def get_container_status():
+    try:
+        result = run_command(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--format",
+                "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.State}}\t{{.RunningFor}}\t{{.Labels}}",
+            ],
+            timeout=15,
+        )
+        rows = []
+        for raw_line in (result.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 5)
+            while len(parts) < 6:
+                parts.append("")
+            name, image, status, state, running_for, labels = parts
+            rows.append(
+                {
+                    "Names": name,
+                    "Image": image,
+                    "Status": status,
+                    "State": state,
+                    "RunningFor": running_for,
+                    "Labels": labels,
+                }
+            )
+        return rows
+    except Exception as exc:
+        logger.warning("get_container_status failed: %s", exc)
+        return []
+
+
+class contextlib_suppress_json:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return exc_type is json.JSONDecodeError
+
+
+def get_task_container_rows():
+    try:
+        rows = get_container_status()
+        interesting_names = {"autoflow-web-hostfix", "autoflow-web", "douyin-task"}
+        return [row for row in rows if row.get("Names") in interesting_names]
+    except Exception as exc:
+        logger.warning("get_task_container_rows failed: %s", exc)
+        return []
+
+
+def run_task_now(*, unsent_only=False, failed_only=False, force_all=False, account_refs=None):
+    try:
+        lock_status = task_run_lock_status()
+        if lock_status.get("running"):
+            logger.info(
+                "Refusing to start manual task because task lock is active pid=%s age=%ss",
+                lock_status.get("pid"),
+                lock_status.get("ageSeconds"),
+            )
+            return TASK_ALREADY_RUNNING
+
+        log_file = log_file_path()
+        command, cwd = build_task_run_spec()
+        run_env = {
+            "AUTOFLOW_MANUAL_RUN": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+        if account_refs is not None:
+            run_env["AUTOFLOW_ACCOUNT_REFS"] = ",".join(sorted({str(ref).strip() for ref in account_refs if str(ref).strip()}))
+        if force_all:
+            run_env["AUTOFLOW_MANUAL_FORCE_ALL"] = "1"
+        elif failed_only:
+            run_env["AUTOFLOW_MANUAL_FAILED_ONLY"] = "1"
+        elif unsent_only:
+            run_env["AUTOFLOW_MANUAL_UNSENT_ONLY"] = "1"
+        logger.info(
+            "Starting background task command=%s cwd=%s env=%s log=%s",
+            command,
+            cwd,
+            {key: run_env[key] for key in sorted(run_env)},
+            log_file,
+        )
+        return run_background_command(
+            command,
+            log_file,
+            cwd=cwd,
+            env=run_env,
+        )
+    except Exception as exc:
+        import traceback
+        Path("task_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        logger.error("run_task_now failed: %s", exc)
+        return -1
+
+
+def run_failed_retry_now(*, account_refs=None):
+    return run_task_now(failed_only=True, account_refs=account_refs)
+
+
+def run_unsent_retry_now(*, account_refs=None):
+    return run_task_now(unsent_only=True, account_refs=account_refs)
+
+
+def refresh_proxy():
+    try:
+        script = Path(get_app_settings().get("proxy_refresh_script") or "")
+        if script.exists():
+            return run_command(["bash", str(script)], timeout=120)
+        return run_command(compose_command("restart", "proxy"), timeout=120)
+    except Exception as exc:
+        logger.error("refresh_proxy failed: %s", exc)
+        return _empty_result(stderr=str(exc))
+
+
+def restart_proxy():
+    try:
+        if running_in_container():
+            return run_command(["docker", "restart", "mihomo"], timeout=120)
+        return run_command(compose_command("restart", "proxy"), timeout=120)
+    except Exception as exc:
+        logger.error("restart_proxy failed: %s", exc)
+        return _empty_result(stderr=str(exc))
+
+
+def read_log_tail(lines=200):
+    log_path = log_file_path()
+    if not log_path.exists():
+        return ""
+    content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(content[-lines:])
+
+
+def read_crontab():
+    if running_in_container() and HOST_CRONTAB_PATH.exists():
+        return HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace")
+    try:
+        result = subprocess.run(["crontab", "-l"], text=True, capture_output=True, timeout=10)
+        if result.returncode != 0:
+            return ""
+        return result.stdout
+    except FileNotFoundError:
+        # Native Windows installs do not provide ``crontab``. The caller can
+        # treat an unavailable scheduler as an empty schedule and still serve
+        # the rest of the dashboard.
+        logger.debug("Optional command not found: crontab")
+        return ""
+    except Exception as exc:
+        logger.warning("read_crontab failed: %s", exc)
+        return ""
+
+
+def _format_window_schedule(window_config):
+    return (
+        f"{int(window_config['startHour']):02d}:00-"
+        f"{int(window_config['endHour']):02d}:00/"
+        f"{int(window_config['scheduleIntervalMinutes'])}m"
+    )
+
+
+def schedule_window_state(now=None):
+    """Report whether right now sits inside today's configured send window.
+
+    The window may only be edited from outside it, so the save route and the
+    panel both need this answer from one place instead of two.
+    """
+    current = now or datetime.now(_schedule_timezone())
+    try:
+        parsed = parse_schedule_string(current_daily_schedule())
+    except ValueError:
+        parsed = None
+    if not parsed or parsed.get("mode") != "window":
+        return {"enabled": False, "inside": False, "label": ""}
+    start = int(parsed["startHour"])
+    end = int(parsed["endHour"])
+    return {
+        "enabled": True,
+        "inside": start <= current.hour < end,
+        "startHour": start,
+        "endHour": end,
+        "label": _format_window_schedule(parsed),
+    }
+
+
+def parse_schedule_string(time_string):
+    raw = str(time_string or "").strip()
+    match = WINDOWED_SCHEDULE_RE.fullmatch(raw)
+    if match:
+        start_hour, start_minute, end_hour, end_minute, interval = [int(part) for part in match.groups()]
+        if start_minute != 0 or end_minute != 0:
+            raise ValueError("Window schedule must use whole hours, e.g. 10:00-18:00/10m")
+        if (
+            start_hour not in range(24)
+            or end_hour not in range(1, 25)
+            or end_hour <= start_hour
+        ):
+            raise ValueError("Window schedule is out of range")
+        if interval not in range(1, 60):
+            raise ValueError("Window schedule interval must be between 1 and 59 minutes")
+        # Fixed at 20 minutes: whatever interval the operator types in the string
+        # is ignored, so a stale value can never change the real cadence.
+        interval = WINDOW_INTERVAL_MINUTES
+        return {
+            "mode": "window",
+            "startHour": start_hour,
+            "endHour": end_hour,
+            "scheduleIntervalMinutes": interval,
+        }
+
+    if not re.fullmatch(r"\d{2}:\d{2}", raw):
+        raise ValueError("Time must use HH:MM or HH:00-HH:00/10m format")
+    hour, minute = [int(part) for part in raw.split(":", 1)]
+    if hour not in range(24) or minute not in range(60):
+        raise ValueError("Time is out of range")
+    return {"mode": "fixed", "hour": hour, "minute": minute}
+
+
+def validate_time_string(time_string):
+    parsed = parse_schedule_string(time_string)
+    if parsed["mode"] != "fixed":
+        raise ValueError("Time must use HH:MM format")
+    return parsed["hour"], parsed["minute"]
+
+
+def strip_douyin_schedule_lines(crontab_text):
+    """Return the crontab text without any douyin task line."""
+    kept = [
+        raw_line.rstrip("\n")
+        for raw_line in str(crontab_text or "").splitlines()
+        if not any(marker in raw_line for marker in TASK_SCHEDULE_MARKERS)
+    ]
+    normalized = "\n".join(line for line in kept if line.strip())
+    if normalized:
+        normalized += "\n"
+    return normalized
+
+
+def douyin_schedule_lines(crontab_text=None):
+    text = read_crontab() if crontab_text is None else crontab_text
+    return [
+        line
+        for line in str(text or "").splitlines()
+        if any(marker in line for marker in TASK_SCHEDULE_MARKERS)
+    ]
+
+
+def schedule_line_kind(line):
+    """Classify a douyin task line as a windowed schedule or a single fixed run."""
+    if is_patrol_schedule_line(line):
+        return "patrol"
+    if "AUTOFLOW_FALLBACK_PHASE=1" in str(line or ""):
+        # The end-of-window fallback runs at one fixed minute but only exists
+        # as part of a window schedule.
+        return "window"
+    fields = str(line or "").split()
+    if len(fields) < 5:
+        return "unknown"
+    minute, hour = fields[0], fields[1]
+    if "/" in minute or "-" in hour or "," in hour:
+        return "window"
+    return "fixed"
+
+
+def get_schedule_alignment(recent_triggers=None):
+    """Compare the configured send window with the task lines that are live.
+
+    ``dailySendWindow.enabled`` is false both for "no automatic sending" and for
+    the single fixed-time mode, whose time is carried by the task line itself
+    (see ``current_daily_schedule``). So the drift worth reporting is a spool
+    that still holds window-style task lines while no window is configured.
+    """
+    window = dict(get_config(force_reload=True).get("dailySendWindow") or {})
+    enabled = bool(window.get("enabled"))
+    all_lines = douyin_schedule_lines()
+    patrol_lines = [line for line in all_lines if is_patrol_schedule_line(line)]
+    lines = [line for line in all_lines if not is_patrol_schedule_line(line)]
+    kinds = sorted({schedule_line_kind(line) for line in lines})
+    if enabled:
+        aligned = bool(lines) and kinds == ["window"]
+        detail = (
+            "配置与实际任务行一致"
+            if aligned
+            else ("配置已启用发送窗口，但 spool 中没有窗口式任务行" if not lines else "配置已启用发送窗口，但 spool 中的任务行形态不一致")
+        )
+    else:
+        aligned = not lines or kinds == ["fixed"]
+        if not lines:
+            detail = "未配置发送窗口，spool 中也没有发送任务行"
+        elif kinds == ["fixed"]:
+            detail = "按单次固定时间调度（该模式的时间保存在任务行内）"
+        else:
+            detail = "配置未启用发送窗口，但 spool 中仍存在窗口式任务行"
+    patrol = _patrol_alignment(enabled, window, lines, patrol_lines)
+    if not patrol["aligned"]:
+        aligned = False
+        detail = f"{detail}；{patrol['detail']}"
+    triggers = recent_trigger_lines() if recent_triggers is None else recent_triggers
+    # The patrol fires before the window opens; it is not a send trigger.
+    triggers = [line for line in triggers if PATROL_TRIGGER_LABEL not in str(line)]
+    missing_triggers = False
+    if enabled:
+        try:
+            now = datetime.now(_schedule_timezone())
+            missing_triggers = now.hour >= int(window.get("startHour") or 0) and not triggers
+        except (TypeError, ValueError):
+            missing_triggers = False
+    return {
+        "windowEnabled": enabled,
+        "configLabel": _format_window_schedule(window) if enabled else "",
+        "fixedLabel": current_daily_schedule() if not enabled else "",
+        "lines": lines,
+        "kinds": kinds,
+        "aligned": aligned,
+        "detail": detail,
+        "patrolLines": patrol_lines,
+        "patrolExpected": patrol["expected"],
+        "patrolAligned": patrol["aligned"],
+        "patrolDetail": patrol["detail"],
+        "recentTriggerCount": len(triggers),
+        "missingTriggers": missing_triggers,
+    }
+
+
+def _expected_patrol_time(enabled, window, send_lines):
+    """Patrol (hour, minute) the live send lines call for, or None."""
+    if enabled:
+        try:
+            return patrol_time_for_schedule(
+                {"mode": "window", "startHour": int(window.get("startHour") or 0)}
+            )
+        except (TypeError, ValueError):
+            return None
+    fixed = [line for line in send_lines if schedule_line_kind(line) == "fixed"]
+    if len(fixed) != 1:
+        return None
+    fields = fixed[0].split()
+    if not (fields[0].isdigit() and fields[1].isdigit()):
+        return None
+    return patrol_time_for_schedule(
+        {"mode": "fixed", "hour": int(fields[1]), "minute": int(fields[0])}
+    )
+
+
+def _patrol_alignment(enabled, window, send_lines, patrol_lines):
+    expected = _expected_patrol_time(enabled, window, send_lines) if send_lines else None
+    expected_label = f"{expected[0]:02d}:{expected[1]:02d}" if expected else ""
+    actual = []
+    for line in patrol_lines:
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            actual.append((int(fields[1]), int(fields[0])))
+        else:
+            actual.append(None)
+    if expected is None:
+        aligned = not patrol_lines
+        detail = "没有定时发送，也没有巡查任务行" if aligned else "没有定时发送，但 spool 中仍有巡查任务行"
+    elif actual == [expected]:
+        aligned = True
+        detail = f"每日巡查 {expected_label}（首次发送前 {PATROL_LEAD_MINUTES} 分钟）"
+    elif not patrol_lines:
+        aligned = False
+        detail = f"缺少每日巡查任务行（应为 {expected_label}）"
+    else:
+        aligned = False
+        detail = f"巡查任务行与发送时间不一致（应为 {expected_label}）"
+    return {"aligned": aligned, "expected": expected_label, "detail": detail}
+
+
+def replace_douyin_cron_schedule(crontab_text, time_string):
+    schedule = parse_schedule_string(time_string)
+    scheduled_command = build_scheduled_task_command()
+    fallback_command = build_unsent_fallback_task_command()
+    updated = []
+
+    for raw_line in crontab_text.splitlines():
+        line = raw_line.rstrip("\n")
+        if any(marker in line for marker in TASK_SCHEDULE_MARKERS):
+            continue
+        updated.append(line)
+
+    if schedule["mode"] == "window":
+        end_hour = schedule["endHour"]
+        if end_hour == 24:
+            if schedule["startHour"] < 23:
+                updated.append(
+                    f"*/{schedule['scheduleIntervalMinutes']} "
+                    f"{schedule['startHour']}-22 * * * "
+                    f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
+                )
+            updated.append(
+                f"0-58/{schedule['scheduleIntervalMinutes']} 23 * * * "
+                f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
+            )
+            updated.append(
+                "59 23 * * * "
+                f"{fallback_command} >> {CRON_LOG_PATH} 2>&1"
+            )
+        else:
+            updated.append(
+                f"*/{schedule['scheduleIntervalMinutes']} {schedule['startHour']}-{end_hour - 1} * * * "
+                f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
+            )
+            updated.append(
+                f"0 {end_hour} * * * "
+                f"{fallback_command} >> {CRON_LOG_PATH} 2>&1"
+            )
+    else:
+        updated.append(
+            f"{schedule['minute']} {schedule['hour']} * * * "
+            f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
+        )
+
+    # One daily account patrol before the first scheduled send of the day.
+    patrol_line = patrol_cron_line(schedule)
+    if patrol_line:
+        updated.append(patrol_line)
+
+    normalized = "\n".join(line for line in updated if line.strip())
+    if normalized:
+        normalized += "\n"
+    return normalized
+
+
+def persist_schedule_config(time_string):
+    parsed = parse_schedule_string(time_string)
+
+    def mutate(config):
+        window = dict(config.get("dailySendWindow") or {})
+        if parsed["mode"] == "window":
+            window.update(
+                {
+                    "enabled": True,
+                    "startHour": parsed["startHour"],
+                    "endHour": parsed["endHour"],
+                    "scheduleIntervalMinutes": parsed["scheduleIntervalMinutes"],
+                }
+            )
+        else:
+            window.update({"enabled": False})
+        config["dailySendWindow"] = window
+        return None, True
+
+    update_config(mutate, force_reload=True)
+
+
+def update_daily_schedule(time_string):
+    persist_schedule_config(time_string)
+    current = read_crontab()
+    updated = replace_douyin_cron_schedule(current, time_string)
+    if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
+        try:
+            HOST_CRONTAB_PATH.write_text(updated, encoding="utf-8")
+            return subprocess.CompletedProcess(args=["write-host-crontab"], returncode=0, stdout="", stderr="")
+        except Exception as exc:
+            logger.error("update_daily_schedule failed: %s", exc)
+            return _empty_result(stderr=str(exc))
+    try:
+        process = subprocess.run(["crontab", "-"], input=updated, text=True, capture_output=True, check=True, timeout=10)
+        return process
+    except Exception as exc:
+        logger.error("update_daily_schedule failed: %s", exc)
+        return _empty_result(stderr=str(exc))
+
+
+def sync_daily_schedule_from_config():
+    config = get_config(force_reload=True)
+    window = dict(config.get("dailySendWindow") or {})
+    if not window.get("enabled"):
+        all_lines = douyin_schedule_lines()
+        lines = [line for line in all_lines if not is_patrol_schedule_line(line)]
+        kinds = {schedule_line_kind(line) for line in lines}
+        if lines and kinds == {"fixed"}:
+            # A single fixed run carries its own time in the task line; only
+            # keep its daily patrol line present and on time.
+            return _sync_fixed_schedule_patrol(lines, all_lines)
+        if not lines and all_lines:
+            # Nothing is scheduled to send, so no patrol either: drop it below.
+            lines = all_lines
+        if not lines:
+            # No window configured, and either nothing is scheduled or a single
+            # fixed run carries its own time in the task line: leave it alone.
+            return subprocess.CompletedProcess(
+                args=["sync-daily-schedule"],
+                returncode=0,
+                stdout="schedule disabled; existing crontab left unchanged",
+                stderr="",
+            )
+        # Window-style task lines survive while no window is configured: that
+        # combination keeps sending on an old window, so reconcile to "off".
+        try:
+            cleaned = strip_douyin_schedule_lines(read_crontab())
+            if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
+                HOST_CRONTAB_PATH.write_text(cleaned, encoding="utf-8")
+                detail = "host spool"
+            else:
+                subprocess.run(
+                    ["crontab", "-"],
+                    input=cleaned,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                detail = "crontab"
+            logger.warning(
+                "No send window is configured but %s stale window task line(s) were live; removed them from the %s",
+                len(lines),
+                detail,
+            )
+            return subprocess.CompletedProcess(
+                args=["sync-daily-schedule"],
+                returncode=0,
+                stdout=f"schedule disabled; removed {len(lines)} stale window task line(s) from the {detail}",
+                stderr="",
+            )
+        except Exception as exc:
+            logger.error("sync_daily_schedule_from_config failed: %s", exc)
+            return _empty_result(stderr=str(exc))
+
+    try:
+        time_string = _format_window_schedule(window)
+        current = read_crontab()
+        updated = replace_douyin_cron_schedule(current, time_string)
+        if updated == current:
+            return subprocess.CompletedProcess(
+                args=["sync-daily-schedule"], returncode=0, stdout="already synchronized", stderr=""
+            )
+        if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
+            HOST_CRONTAB_PATH.write_text(updated, encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=["sync-daily-schedule"], returncode=0, stdout="host spool updated", stderr=""
+            )
+        return subprocess.run(
+            ["crontab", "-"],
+            input=updated,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.error("sync_daily_schedule_from_config failed: %s", exc)
+        return _empty_result(stderr=str(exc))
+
+
+def _sync_fixed_schedule_patrol(send_lines, all_lines):
+    """Keep the patrol line of a single fixed-time schedule in step with it."""
+    unchanged = subprocess.CompletedProcess(
+        args=["sync-daily-schedule"],
+        returncode=0,
+        stdout="schedule disabled; existing crontab left unchanged",
+        stderr="",
+    )
+    if len(send_lines) != 1:
+        return unchanged
+    fields = send_lines[0].split()
+    if not (fields[0].isdigit() and fields[1].isdigit()):
+        return unchanged
+    expected = patrol_cron_line(
+        {"mode": "fixed", "hour": int(fields[1]), "minute": int(fields[0])}
+    )
+    patrol_lines = [line.strip() for line in all_lines if is_patrol_schedule_line(line)]
+    if patrol_lines == [expected.strip()]:
+        return unchanged
+    try:
+        kept = [
+            raw_line.rstrip("\n")
+            for raw_line in read_crontab().splitlines()
+            if raw_line.strip() and not is_patrol_schedule_line(raw_line)
+        ]
+        kept.append(expected)
+        updated = "\n".join(kept) + "\n"
+        if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
+            HOST_CRONTAB_PATH.write_text(updated, encoding="utf-8")
+            stdout = "host spool updated"
+        else:
+            subprocess.run(
+                ["crontab", "-"],
+                input=updated,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            stdout = "crontab updated"
+        logger.info("Synchronized the daily patrol line of the fixed-time schedule")
+        return subprocess.CompletedProcess(
+            args=["sync-daily-schedule"],
+            returncode=0,
+            stdout=f"fixed schedule kept; patrol line synchronized ({stdout})",
+            stderr="",
+        )
+    except Exception as exc:
+        logger.error("sync_daily_schedule_from_config failed: %s", exc)
+        return _empty_result(stderr=str(exc))
+
+
+def current_daily_schedule():
+    config = get_config(force_reload=True)
+    window = dict(config.get("dailySendWindow") or {})
+    if window.get("enabled"):
+        try:
+            return _format_window_schedule(window)
+        except Exception:
+            logger.warning("current_daily_schedule found invalid dailySendWindow=%s", window)
+
+    for line in read_crontab().splitlines():
+        if is_patrol_schedule_line(line):
+            # The patrol line is not a send time.
+            continue
+        if any(marker in line for marker in TASK_SCHEDULE_MARKERS):
+            parts = line.split(maxsplit=5)
+            if len(parts) >= 2:
+                if parts[0].isdigit() and parts[1].isdigit():
+                    minute = int(parts[0])
+                    hour = int(parts[1])
+                    return f"{hour:02d}:{minute:02d}"
+                return f"{parts[1]}:{parts[0]}"
+    return ""
+
+
+def _next_window_trigger(now, window):
+    interval = max(1, int(window["scheduleIntervalMinutes"]))
+    candidates = []
+    end_hour = int(window["endHour"])
+    for hour in range(int(window["startHour"]), end_hour):
+        for minute in range(0, 60, interval):
+            if end_hour == 24 and hour == 23 and minute == 59:
+                continue
+            candidates.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
+    fallback_at = now.replace(
+        hour=23 if end_hour == 24 else end_hour,
+        minute=59 if end_hour == 24 else 0,
+        second=0,
+        microsecond=0,
+    )
+    candidates.append(fallback_at)
+    for candidate in sorted(set(candidates)):
+        if candidate > now:
+            return candidate
+    tomorrow = now + timedelta(days=1)
+    return tomorrow.replace(
+        hour=int(window["startHour"]),
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+FRIENDS_CACHE_TTL_HOURS = 168
+
+# The send window interval is fixed: the console no longer offers an interval
+# input, so the value inside the schedule string is ignored.
+WINDOW_INTERVAL_MINUTES = 20
+
+
+def duplicate_display_names(accounts):
+    """Return {nickname: count} for nicknames shared by more than one account.
+
+    A duplicate row usually means a re-login came back with a different
+    unique_id; the console should say so instead of leaving the operator to
+    notice two identical cards.
+    """
+    counts: dict[str, int] = {}
+    for item in accounts or []:
+        name = str((item or {}).get("username") or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return {name: count for name, count in counts.items() if count > 1}
+
+
+def cache_age_label(value, ttl_hours=FRIENDS_CACHE_TTL_HOURS):
+    """Human label for a cached-friends timestamp, flagging a stale cache."""
+    parsed = _parse_sent_at(value, _schedule_timezone())
+    if not parsed:
+        return ""
+    now = datetime.now(_schedule_timezone())
+    seconds = max(0, int((now - parsed).total_seconds()))
+    if seconds < 3600:
+        label = f"{max(1, seconds // 60)} 分钟前"
+    elif seconds < 86400:
+        label = f"{seconds // 3600} 小时前"
+    else:
+        label = f"{seconds // 86400} 天前"
+    if seconds > max(1, int(ttl_hours)) * 3600:
+        return f"{label} · 已过期，建议刷新好友"
+    return label
+
+
+def preview_daily_schedule(time_string):
+    """Validate a schedule string and describe what it would actually do.
+
+    Returns the normalised label, the next trigger, a rough estimate of how long
+    one run needs, and warnings when the interval or the window is too short for
+    the configured targets. The estimate is deliberately coarse and labelled as
+    such in the UI: the real pacing comes from the send loop, not from here.
+    """
+    raw = str(time_string or "").strip()
+    empty = {
+        "ok": False,
+        "error": "",
+        "label": "",
+        "nextTriggerAt": "",
+        "nextTriggerDisplay": "",
+        "estimatedRunSeconds": 0,
+        "estimatedRunDisplay": "",
+        "slotsPerDay": 0,
+        "targetCount": 0,
+        "warnings": [],
+    }
+    try:
+        parsed = parse_schedule_string(raw)
+    except ValueError as exc:
+        return {**empty, "error": str(exc)}
+
+    now = datetime.now(_schedule_timezone())
+    config = get_config(force_reload=True)
+    strategy = dict(config.get("sendStrategy") or {})
+    try:
+        min_interval = max(0, int(strategy.get("messageIntervalSecondsMin") or 0))
+        max_interval = max(min_interval, int(strategy.get("messageIntervalSecondsMax") or 0))
+    except (TypeError, ValueError):
+        min_interval, max_interval = 0, 0
+    average_interval = (min_interval + max_interval) / 2
+    summary = get_send_console_snapshot().get("summary") or {}
+    target_count = int(summary.get("total_targets") or 0)
+    account_count = max(1, int(summary.get("enabled_accounts") or 0))
+    estimated_run_seconds = int(target_count * average_interval) + account_count * 45
+
+    warnings = []
+    if parsed["mode"] == "fixed":
+        label = f"{parsed['hour']:02d}:{parsed['minute']:02d}"
+        next_trigger = now.replace(
+            hour=parsed["hour"], minute=parsed["minute"], second=0, microsecond=0
+        )
+        if next_trigger <= now:
+            next_trigger += timedelta(days=1)
+        slots_per_day = 1
+        warnings.append(
+            "单次固定时间：每天只触发一次。这个模式会把发送窗口标记为未启用，"
+            "时间保存在任务行本身，因此面板的窗口输入会显示该时间。"
+        )
+    else:
+        label = _format_window_schedule(parsed)
+        window = {
+            "startHour": parsed["startHour"],
+            "endHour": parsed["endHour"],
+            "scheduleIntervalMinutes": parsed["scheduleIntervalMinutes"],
+        }
+        next_trigger = _next_window_trigger(now, window)
+        span_seconds = max(0, (parsed["endHour"] - parsed["startHour"]) * 3600)
+        slots_per_day = max(1, span_seconds // (parsed["scheduleIntervalMinutes"] * 60))
+        interval_seconds = parsed["scheduleIntervalMinutes"] * 60
+        if estimated_run_seconds > interval_seconds:
+            warnings.append(
+                f"一轮预计约 {_format_duration_seconds(estimated_run_seconds)}，"
+                f"超过触发间隔 {parsed['scheduleIntervalMinutes']} 分钟：任务会重叠，"
+                "后来的一次会被运行锁跳过。"
+            )
+        if span_seconds and estimated_run_seconds > span_seconds:
+            warnings.append("窗口总时长小于一轮预计耗时，今天很可能发不完。")
+
+    return {
+        **empty,
+        "ok": True,
+        "label": label,
+        "nextTriggerAt": next_trigger.isoformat(timespec="seconds"),
+        "nextTriggerDisplay": next_trigger.strftime("%m-%d %H:%M"),
+        "estimatedRunSeconds": estimated_run_seconds,
+        "estimatedRunDisplay": _format_duration_seconds(estimated_run_seconds) or "不到 1 分钟",
+        "slotsPerDay": slots_per_day,
+        "targetCount": target_count,
+        "warnings": warnings,
+    }
+
+
+def get_schedule_snapshot(now=None):
+    now = now or datetime.now(_schedule_timezone())
+    window = _normalize_send_window()
+    label = current_daily_schedule()
+    if window.get("enabled"):
+        next_trigger = _next_window_trigger(now, window)
+    else:
+        try:
+            hour, minute = [int(part) for part in label.split(":", 1)]
+            next_trigger = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if next_trigger <= now:
+                next_trigger += timedelta(days=1)
+        except (TypeError, ValueError):
+            next_trigger = None
+    return {
+        "label": label,
+        "nextTriggerAt": next_trigger.isoformat(timespec="seconds") if next_trigger else "",
+        "nextTriggerDisplay": next_trigger.strftime("%m-%d %H:%M") if next_trigger else "",
+    }
+
+
+def _schedule_timezone():
+    timezone_name = (
+        str(os.getenv("AUTOFLOW_TIMEZONE") or "").strip()
+        or str(os.getenv("TZ") or "").strip()
+        or "Asia/Shanghai"
+    )
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        if timezone_name == "Asia/Shanghai":
+            return timezone(timedelta(hours=8), name="Asia/Shanghai")
+        return datetime.now().astimezone().tzinfo
+
+
+def _normalize_send_window():
+    raw = dict(get_config(force_reload=True).get("dailySendWindow") or {})
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "startHour": int(raw.get("startHour", 10)),
+        "endHour": int(raw.get("endHour", 18)),
+        "scheduleIntervalMinutes": max(1, int(raw.get("scheduleIntervalMinutes", 10))),
+    }
+
+
+def _parse_sent_at(raw_value, local_tz):
+    return parse_sent_at(raw_value, local_tz)
+
+
+def _account_identity(user):
+    return str(user.get("unique_id") or user.get("username") or "unknown").strip()
+
+
+def _coerce_attempt_count(entry):
+    try:
+        return int(dict(entry or {}).get("attemptCount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _account_failure_pause_after_attempts():
+    raw_value = str(os.getenv("AUTOFLOW_ACCOUNT_FAILURE_PAUSE_AFTER_ATTEMPTS") or "2").strip()
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 2
+
+
+def _account_failure_pause_active(account_failure, now, pause_after):
+    if _coerce_attempt_count(account_failure) < pause_after:
+        return False
+    category = str(account_failure.get("category") or "")
+    if category not in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES:
+        return True
+    last_attempt_at = _parse_sent_at(
+        account_failure.get("lastAttemptAt"),
+        now.tzinfo,
+    )
+    if not last_attempt_at:
+        return True
+    elapsed_seconds = (now - last_attempt_at).total_seconds()
+    return elapsed_seconds < _temporary_account_failure_cooldown_minutes() * 60
+
+
+def _account_failure_cooldown_remaining_seconds(account_failure, now):
+    """Seconds left in the temporary-failure cooldown (0 when not cooling down)."""
+    category = str((account_failure or {}).get("category") or "")
+    if category not in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES:
+        return 0
+    last_attempt_at = _parse_sent_at(
+        (account_failure or {}).get("lastAttemptAt"),
+        now.tzinfo,
+    )
+    if not last_attempt_at:
+        return 0
+    remaining = (
+        last_attempt_at
+        + timedelta(minutes=_temporary_account_failure_cooldown_minutes())
+        - now
+    ).total_seconds()
+    return max(0, int(remaining))
+
+
+def _format_duration_seconds(seconds):
+    seconds = max(0, int(seconds))
+    if seconds <= 0:
+        return ""
+    minutes = seconds // 60
+    if minutes <= 0:
+        return f"{seconds} 秒"
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    return f"{minutes // 60} 小时 {minutes % 60} 分钟"
+
+
+def _account_failure_entry_today(account, now):
+    entry = dict(account.get("account_failure") or {})
+    last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
+    category = str(entry.get("category") or "")
+    cooldown_active = bool(
+        last_attempt_at
+        and category in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES
+        and now
+        < last_attempt_at
+        + timedelta(minutes=_temporary_account_failure_cooldown_minutes())
+    )
+    if last_attempt_at and (
+        last_attempt_at.date() == now.date() or cooldown_active
+    ):
+        entry["lastAttemptAt"] = last_attempt_at.isoformat(timespec="seconds")
+        first_attempt_at = _parse_sent_at(entry.get("firstAttemptAt"), now.tzinfo)
+        if first_attempt_at:
+            entry["firstAttemptAt"] = first_attempt_at.isoformat(timespec="seconds")
+        entry["attemptCount"] = _coerce_attempt_count(entry)
+        entry["affectedTargets"] = list(entry.get("affectedTargets") or [])
+        return entry
+    return {}
+
+
+def _normalize_friend_index_key(value):
+    raw = unicodedata.normalize("NFKC", str(value or ""))
+    for token in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        raw = raw.replace(token, "")
+    raw = raw.replace("\xa0", " ")
+    return " ".join(raw.split()).strip().casefold()
+
+
+def _friend_index_status(account, target_name):
+    friend_index = dict(account.get("friend_index") or {})
+    normalized_target = _normalize_friend_index_key(target_name)
+    entry = {}
+    for key, record in friend_index.items():
+        if not isinstance(record, dict):
+            continue
+        normalized_names = {
+            _normalize_friend_index_key(key),
+            _normalize_friend_index_key(record.get("visibleName")),
+        }
+        if normalized_target in normalized_names:
+            entry = dict(record)
+            break
+    return {
+        "seen": bool(entry),
+        "visibleName": str(entry.get("visibleName") or ""),
+        "stableKeys": list(entry.get("stableKeys") or []),
+        "lastSeenAt": str(entry.get("lastSeenAt") or ""),
+    }
+
+
+def _account_blocked_target_status(account, item, account_failure, now):
+    blocked_item = dict(item)
+    target_name = str(blocked_item.get("target") or "")
+    account_failure_affected = any(
+        streak_state.target_keys_match(account, target_name, affected_target)
+        for affected_target in (account_failure.get("affectedTargets") or [])
+    )
+    category = str(account_failure.get("category") or "")
+    category_label = FAILURE_CATEGORY_LABELS.get(category, category or "账号异常")
+    remaining = _account_failure_cooldown_remaining_seconds(account_failure, now)
+    remaining_label = _format_duration_seconds(remaining)
+    blocked_item.update(
+        {
+            "status": "account_blocked",
+            "category": category,
+            "reason": str(account_failure.get("reason") or ""),
+            "attemptCount": _coerce_attempt_count(account_failure),
+            "lastAttemptAt": str(account_failure.get("lastAttemptAt") or ""),
+            "accountFailureAffected": account_failure_affected,
+            "cooldownRemainingSeconds": remaining,
+            "skipReason": (
+                f"账号冷却中（{category_label}），剩余 {remaining_label} 后才会再尝试"
+                if remaining_label
+                else f"账号异常（{category_label}），今天不再发送，明天恢复"
+            ),
+        }
+    )
+    return blocked_item
+
+
+def _scheduled_send_time(user, target_name, send_window, now):
+    window_minutes = max(1, (send_window["endHour"] - send_window["startHour"]) * 60)
+    start_of_window = now.replace(
+        hour=send_window["startHour"],
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    seed = f"{now.date().isoformat()}|{_account_identity(user)}|{target_name}"
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    offset_minutes = int.from_bytes(digest[:8], "big") % window_minutes
+    return start_of_window + timedelta(minutes=offset_minutes)
+
+
+def _base_target_status(account, target_name, now):
+    return {
+        "target": target_name,
+        "targetRef": streak_state.resolve_target_ref(account, target_name),
+        "sendState": streak_state.target_state(account, target_name, now).get("status") or "",
+        "status": "",
+        "message": "",
+        "sentAt": "",
+        "lastAttemptAt": "",
+        "category": "",
+        "reason": "",
+        "attemptCount": 0,
+        "scheduledAt": "",
+        "friendIndex": _friend_index_status(account, target_name),
+        "confirmationLevel": "",
+        "confirmationSource": "",
+        "confirmationDetail": "",
+        "needsVerification": False,
+        "legacyUnverified": False,
+        "displaySentAt": "",
+        "displayLastAttemptAt": "",
+        "displayScheduledAt": "",
+        "confirmationLabel": "",
+        "categoryLabel": "",
+    }
+
+
+def _history_entry_is_strong_confirmed(history_entry, sent_at, now):
+    return history_entry_is_strong_confirmed_today(history_entry, now)
+
+
+def _format_short_time(raw_value, now):
+    parsed = _parse_sent_at(raw_value, now.tzinfo)
+    if not parsed:
+        return ""
+    if parsed.date() == now.date():
+        return parsed.strftime("%H:%M:%S")
+    return parsed.strftime("%m-%d %H:%M")
+
+
+def _finalize_target_status(item, now):
+    item = dict(item)
+    item["displaySentAt"] = _format_short_time(item.get("sentAt"), now)
+    item["displayLastAttemptAt"] = _format_short_time(item.get("lastAttemptAt"), now)
+    item["displayScheduledAt"] = _format_short_time(item.get("scheduledAt"), now)
+    source = str(item.get("confirmationSource") or "")
+    category = str(item.get("category") or "")
+    item["confirmationLabel"] = CONFIRMATION_LABELS.get(source, source or "-")
+    item["categoryLabel"] = FAILURE_CATEGORY_LABELS.get(category, category or "-")
+    return item
+
+
+def _build_target_status(account, target_name, now, send_window):
+    item = _base_target_status(account, target_name, now)
+    state = streak_state.target_state(account, target_name, now)
+
+    history_entry = streak_state.history_entry(account, target_name, now.tzinfo)
+    sent_at = _parse_sent_at(history_entry.get("sentAt"), now.tzinfo)
+    if streak_state.is_streak_verified(account, target_name, now):
+        item.update(
+            {
+                "status": "sent",
+                "message": str(history_entry.get("message") or ""),
+                "sentAt": sent_at.isoformat(timespec="seconds") if sent_at else "",
+                "confirmationLevel": "verified",
+                "confirmationSource": "streak_verified",
+                "confirmationDetail": str(state.get("lastEvidenceDetail") or ""),
+                "needsVerification": False,
+            }
+        )
+        return _finalize_target_status(item, now)
+    if (
+        str(state.get("status") or "")
+        == streak_state.STATE_FAILED_RETRYABLE
+        and str(state.get("lastErrorCategory") or "") == "send_unconfirmed"
+    ):
+        last_attempt_at = _parse_sent_at(
+            state.get("lastAttemptAt"),
+            now.tzinfo,
+        )
+        item.update(
+            {
+                "status": "unconfirmed",
+                "message": str(
+                    history_entry.get("message")
+                    or state.get("lastEvidenceDetail")
+                    or ""
+                ),
+                "sentAt": (
+                    sent_at.isoformat(timespec="seconds") if sent_at else ""
+                ),
+                "lastAttemptAt": (
+                    last_attempt_at.isoformat(timespec="seconds")
+                    if last_attempt_at
+                    else ""
+                ),
+                "category": "send_unconfirmed",
+                "reason": str(
+                    state.get("lastErrorReason")
+                    or "manual reset requires verification"
+                ),
+                "attemptCount": int(state.get("attemptCount") or 0),
+                "confirmationLevel": "weak",
+                "confirmationSource": str(
+                    state.get("confirmationSource") or "manual_reset"
+                ),
+                "confirmationDetail": str(
+                    state.get("lastEvidenceDetail") or ""
+                ),
+                "needsVerification": True,
+            }
+        )
+        return _finalize_target_status(item, now)
+    if streak_state.is_send_confirmed(account, target_name, now):
+        state_sent_at = _parse_sent_at(state.get("sentAt"), now.tzinfo)
+        item.update(
+            {
+                "status": "sent",
+                "message": str(history_entry.get("message") or ""),
+                "sentAt": (
+                    state_sent_at.isoformat(timespec="seconds")
+                    if state_sent_at
+                    else (sent_at.isoformat(timespec="seconds") if sent_at else "")
+                ),
+                "confirmationLevel": "strong",
+                "confirmationSource": str(
+                    state.get("confirmationSource") or "protocol_send_receipt"
+                ),
+                "confirmationDetail": str(state.get("lastEvidenceDetail") or ""),
+                "needsVerification": False,
+            }
+        )
+        return _finalize_target_status(item, now)
+    if _history_entry_is_strong_confirmed(history_entry, sent_at, now):
+        item.update(
+            {
+                "status": "sent",
+                "message": str(history_entry.get("message") or ""),
+                "sentAt": sent_at.isoformat(timespec="seconds"),
+                "confirmationLevel": str(history_entry.get("confirmationLevel") or "strong"),
+                "confirmationSource": str(history_entry.get("confirmationSource") or "browser_visible_count_increased"),
+                "confirmationDetail": str(history_entry.get("confirmationDetail") or ""),
+            }
+        )
+        return _finalize_target_status(item, now)
+
+    failure_entry = streak_state.failure_entry(account, target_name, now.tzinfo)
+    last_attempt_at = _parse_sent_at(failure_entry.get("lastAttemptAt"), now.tzinfo)
+    failure_is_today = bool(last_attempt_at and last_attempt_at.date() == now.date())
+
+    if sent_at and sent_at.date() == now.date():
+        confirmation_level = str(history_entry.get("confirmationLevel") or "legacy")
+        confirmation_source = str(history_entry.get("confirmationSource") or "legacy_sentAt_only")
+        confirmation_detail = str(history_entry.get("confirmationDetail") or "")
+        legacy_unverified = not history_entry.get("confirmationLevel")
+        if legacy_unverified:
+            confirmation_detail = confirmation_detail or "旧格式发送账本缺少强确认字段，已降级为待核验。"
+        # Only a real weak-evidence send counts as "sent with page echo"; a record
+        # that carries nothing but a timestamp (or was manually reset) still needs
+        # verification.
+        page_echo_evidence = bool(
+            not legacy_unverified
+            and confirmation_level == "weak"
+            and confirmation_source
+            not in ("", "legacy_sentAt_only", "manual_reset")
+        )
+        item.update(
+            {
+                "status": (
+                    "sent_receipt_only"
+                    if confirmation_level == "receipt_only"
+                    else ("sent_page_echo" if page_echo_evidence else "unconfirmed")
+                ),
+                "message": str(history_entry.get("message") or failure_entry.get("message") or ""),
+                "sentAt": sent_at.isoformat(timespec="seconds"),
+                "lastAttemptAt": last_attempt_at.isoformat(timespec="seconds") if failure_is_today else "",
+                "category": str(failure_entry.get("category") or "send_unconfirmed"),
+                "reason": str(
+                    failure_entry.get("reason")
+                    or confirmation_detail
+                    or (
+                        "已发出，但只取得页面回显这一弱证据，未取得服务端强确认。"
+                        if page_echo_evidence
+                        else "发送记录缺少强确认，需要核验。"
+                    )
+                ),
+                "attemptCount": int(failure_entry.get("attemptCount") or 0),
+                "confirmationLevel": confirmation_level,
+                "confirmationSource": confirmation_source,
+                "confirmationDetail": confirmation_detail,
+                "needsVerification": True,
+                "legacyUnverified": legacy_unverified,
+                "skipReason": (
+                    "今日已发出（仅页面回显），明日可重试；不确定可点“不确定，重发”"
+                    if page_echo_evidence
+                    else "发送记录缺少任何证据，可重试或点“待核验”重发"
+                ),
+            }
+        )
+        return _finalize_target_status(item, now)
+
+    if failure_is_today:
+        category = str(failure_entry.get("category") or "")
+        status = "unconfirmed" if category == "send_unconfirmed" else "failed"
+        item.update(
+            {
+                "status": status,
+                "message": str(failure_entry.get("message") or ""),
+                "lastAttemptAt": last_attempt_at.isoformat(timespec="seconds"),
+                "category": category,
+                "reason": str(failure_entry.get("reason") or ""),
+                "attemptCount": int(failure_entry.get("attemptCount") or 0),
+                "confirmationLevel": str(failure_entry.get("confirmationLevel") or ("weak" if status == "unconfirmed" else "")),
+                "confirmationSource": str(failure_entry.get("confirmationSource") or ""),
+                "confirmationDetail": str(failure_entry.get("reason") or ""),
+                "needsVerification": status == "unconfirmed",
+            }
+        )
+        return _finalize_target_status(item, now)
+
+    scheduled_at = None
+    if send_window.get("enabled"):
+        scheduled_at = _scheduled_send_time(account, target_name, send_window, now)
+        if scheduled_at > now:
+            item.update(
+                {
+                    "status": "pending",
+                    "scheduledAt": scheduled_at.isoformat(timespec="seconds"),
+                }
+            )
+            return _finalize_target_status(item, now)
+
+    item.update(
+        {
+            "status": "unprocessed",
+            "scheduledAt": scheduled_at.isoformat(timespec="seconds") if scheduled_at else "",
+        }
+    )
+    return _finalize_target_status(item, now)
+
+
+def _orphan_records(account, configured_targets):
+    configured_targets = [str(target) for target in configured_targets]
+    configured_target_set = set(configured_targets)
+    configured_target_refs = {
+        streak_state.target_ref_for_stored_key(account, target)
+        for target in configured_targets
+        if streak_state.target_ref_for_stored_key(account, target)
+    }
+
+    def is_configured(key):
+        if str(key) in configured_target_set:
+            return True
+        return (
+            streak_state.target_ref_for_stored_key(account, key)
+            in configured_target_refs
+        )
+
+    history = dict(account.get("message_history") or {})
+    failure_queue = dict(account.get("failure_queue") or {})
+    orphan_history = sorted(
+        str(target)
+        for target in history
+        if not is_configured(target)
+    )
+    orphan_failure = sorted(
+        str(target)
+        for target in failure_queue
+        if not is_configured(target)
+    )
+    return orphan_history, orphan_failure
+
+
+
+def identity_view(account):
+    """Identity fields for the console: state, label, hint and both IDs."""
+    state = account_identity.identity_state(account)
+    return {
+        "identity_state": state,
+        "identity_label": account_identity.IDENTITY_STATE_LABELS.get(state, ""),
+        "identity_hint": account_identity.IDENTITY_STATE_HINTS.get(state, ""),
+        "platform_uid": account_identity.account_uid(account),
+        "display_id": str(account.get(account_identity.FIELD_DISPLAY_ID) or ""),
+    }
+
+def get_send_console_snapshot(account_refs=None):
+    allowed_refs = None if account_refs is None else {str(ref).strip() for ref in account_refs}
+    accounts = [
+        account
+        for account in get_userData(force_reload=True)
+        if account.get("enabled", True) and (allowed_refs is None or account.get("account_ref") in allowed_refs)
+    ]
+    send_window = _normalize_send_window()
+    now = datetime.now(_schedule_timezone())
+
+    summary = {
+        "enabled_accounts": len(accounts),
+        "total_targets": 0,
+        "today_sent_targets": 0,
+        "today_confirmed_targets": 0,
+        "today_unconfirmed_targets": 0,
+        "today_page_echo_targets": 0,
+        "today_receipt_only_targets": 0,
+        "today_legacy_unverified_targets": 0,
+        "today_failed_targets": 0,
+        "today_pending_targets": 0,
+        "today_unprocessed_targets": 0,
+        "today_account_blocked_targets": 0,
+        "today_attention_targets": 0,
+        "today_remaining_targets": 0,
+        "today_account_failures": 0,
+        "today_account_paused": 0,
+        "today_warning_count": 0,
+        "orphan_history_records": 0,
+        "orphan_failure_records": 0,
+        "last_confirmed_at": "",
+        "last_confirmed_display": "",
+        "all_confirmed": False,
+    }
+    account_rows = []
+    account_failure_pause_after = _account_failure_pause_after_attempts()
+
+    for account in accounts:
+        configured_targets = list(account.get("targets") or [])
+        statuses = [_build_target_status(account, target_name, now, send_window) for target_name in configured_targets]
+        confirmed_targets = [item for item in statuses if item["status"] == "sent"]
+        # A target that was sent and only produced the weak page-echo evidence is
+        # finished for today (the engine will not resend it), so it belongs to
+        # the "sent" side of the board, not to "needs attention".
+        page_echo_targets = [item for item in statuses if item["status"] == "sent_page_echo"]
+        receipt_only_targets = [item for item in statuses if item["status"] == "sent_receipt_only"]
+        sent_targets = confirmed_targets + page_echo_targets
+        unconfirmed_targets = [item for item in statuses if item["status"] == "unconfirmed"]
+        failed_targets = [item for item in statuses if item["status"] == "failed"]
+        account_health = dict(account.get("account_health") or {})
+        preflight_failed = account_health.get("healthy") is False
+        account_failure = _account_failure_entry_today(account, now)
+        failure_paused = _account_failure_pause_active(
+            account_failure,
+            now,
+            account_failure_pause_after,
+        )
+        account_paused = bool(failure_paused or preflight_failed)
+        pause_entry = (
+            account_failure
+            if failure_paused
+            else {
+                "category": str(account_health.get("category") or "account_preflight"),
+                "reason": str(
+                    account_health.get("reason")
+                    or "account health preflight failed"
+                ),
+                "attemptCount": 0,
+                "lastAttemptAt": str(account_health.get("checkedAt") or ""),
+                "affectedTargets": [],
+            }
+        )
+        account_blocked_targets = []
+        if account_paused:
+            account_blocked_targets = [
+                _finalize_target_status(
+                    _account_blocked_target_status(account, item, pause_entry, now),
+                    now,
+                )
+                for item in statuses
+                if item["status"] in {"pending", "unprocessed"}
+            ]
+            pending_targets = []
+            unprocessed_targets = []
+        else:
+            pending_targets = [item for item in statuses if item["status"] == "pending"]
+            unprocessed_targets = [item for item in statuses if item["status"] == "unprocessed"]
+        friend_index_meta = dict(account.get("friend_index_meta") or {})
+        friend_index_last_scan_at = _parse_sent_at(friend_index_meta.get("lastScanAt"), now.tzinfo)
+        if friend_index_last_scan_at:
+            friend_index_meta["lastScanAt"] = friend_index_last_scan_at.isoformat(timespec="seconds")
+        friend_index_meta["missingTargets"] = list(friend_index_meta.get("missingTargets") or [])
+        friend_index_meta["lastScanComplete"] = bool(friend_index_meta.get("lastScanComplete"))
+        try:
+            friend_index_meta["scannedCount"] = int(friend_index_meta.get("scannedCount") or 0)
+        except (TypeError, ValueError):
+            friend_index_meta["scannedCount"] = 0
+
+        orphan_history, orphan_failure = _orphan_records(account, configured_targets)
+        warnings = []
+        if preflight_failed:
+            warnings.append(
+                {
+                    "category": "account_preflight",
+                    "message": (
+                        "账号预检失败，已暂停："
+                        f"{pause_entry.get('reason') or pause_entry.get('category')}"
+                    ),
+                }
+            )
+        if not configured_targets:
+            warnings.append({"category": "no_targets", "message": "该启用账号没有配置目标，不能代表全部续上。"})
+        if orphan_history:
+            warnings.append({"category": "orphan_history", "message": f"有 {len(orphan_history)} 条发送账本不在当前目标列表中。"})
+        if orphan_failure:
+            warnings.append({"category": "orphan_failure", "message": f"有 {len(orphan_failure)} 条失败队列记录不在当前目标列表中。"})
+        legacy_unverified_targets = [item for item in unconfirmed_targets if item.get("legacyUnverified")]
+        attention_count = len(unconfirmed_targets) + len(failed_targets) + len(account_blocked_targets)
+        pending_count = len(pending_targets) + len(unprocessed_targets)
+        confirmed_times = [
+            _parse_sent_at(item.get("sentAt"), now.tzinfo)
+            for item in confirmed_targets
+            if item.get("sentAt")
+        ]
+        confirmed_times = [item for item in confirmed_times if item]
+        last_confirmed_at = max(confirmed_times).isoformat(timespec="seconds") if confirmed_times else ""
+        if account_paused:
+            account_state = "paused"
+        elif attention_count:
+            account_state = "attention"
+        elif warnings:
+            account_state = "warning"
+        elif pending_count:
+            account_state = "pending"
+        else:
+            account_state = "healthy"
+
+        summary["total_targets"] += len(configured_targets)
+        summary["today_sent_targets"] += len(sent_targets)
+        summary["today_confirmed_targets"] += len(confirmed_targets)
+        summary["today_unconfirmed_targets"] += len(unconfirmed_targets)
+        summary["today_page_echo_targets"] += len(page_echo_targets)
+        summary["today_receipt_only_targets"] += len(receipt_only_targets)
+        summary["today_legacy_unverified_targets"] += len(legacy_unverified_targets)
+        summary["today_failed_targets"] += len(failed_targets)
+        summary["today_pending_targets"] += len(pending_targets)
+        summary["today_unprocessed_targets"] += len(unprocessed_targets)
+        summary["today_account_blocked_targets"] += len(account_blocked_targets)
+        summary["today_attention_targets"] += attention_count
+        summary["today_remaining_targets"] += (
+            len(unconfirmed_targets)
+            + len(failed_targets)
+            + len(pending_targets)
+            + len(unprocessed_targets)
+            + len(account_blocked_targets)
+        )
+        summary["today_warning_count"] += len(warnings)
+        summary["orphan_history_records"] += len(orphan_history)
+        summary["orphan_failure_records"] += len(orphan_failure)
+        if account_failure:
+            summary["today_account_failures"] += 1
+        if account_paused:
+            summary["today_account_paused"] += 1
+        if last_confirmed_at and (
+            not summary["last_confirmed_at"] or last_confirmed_at > summary["last_confirmed_at"]
+        ):
+            summary["last_confirmed_at"] = last_confirmed_at
+
+        account_rows.append(
+            {
+                "account_ref": str(account.get("account_ref") or ""),
+                "unique_id": str(account.get("unique_id") or ""),
+                "username": account.get("username") or "",
+                "total_targets": len(configured_targets),
+                "sent_targets": sent_targets,
+                "confirmed_targets": confirmed_targets,
+                "page_echo_targets": page_echo_targets,
+                "receipt_only_targets": receipt_only_targets,
+                "page_echo_count": len(page_echo_targets),
+                "receipt_only_count": len(receipt_only_targets),
+                "unconfirmed_targets": unconfirmed_targets,
+                "legacy_unverified_targets": legacy_unverified_targets,
+                "failed_targets": failed_targets,
+                "pending_targets": pending_targets,
+                "unprocessed_targets": unprocessed_targets,
+                "account_blocked_targets": account_blocked_targets,
+                "last_failure_reason": failed_targets[0]["reason"] if failed_targets else "",
+                "last_unconfirmed_reason": unconfirmed_targets[0]["reason"] if unconfirmed_targets else "",
+                "failure_queue": dict(account.get("failure_queue") or {}),
+                "account_failure": account_failure,
+                "account_paused": account_paused,
+                "account_failure_pause_after": account_failure_pause_after,
+                "state": account_state,
+                "account_health": account_health,
+                "login_verification_state": str((account.get("login_verification") or {}).get("state") or ""),
+                **identity_view(account),
+                "attention_count": attention_count,
+                "pending_count": pending_count,
+                "last_confirmed_at": last_confirmed_at,
+                "last_confirmed_display": _format_short_time(last_confirmed_at, now),
+                "friend_index_meta": friend_index_meta,
+                "friend_index_count": len(dict(account.get("friend_index") or {})),
+                "warnings": warnings,
+                "orphan_history_records": orphan_history,
+                "orphan_failure_records": orphan_failure,
+            }
+        )
+
+    state_rank = {"paused": 0, "attention": 1, "warning": 2, "pending": 3, "healthy": 4}
+    account_rows.sort(key=lambda row: (state_rank.get(row.get("state"), 9), str(row.get("username") or "")))
+
+    summary["all_confirmed"] = bool(
+        summary["total_targets"] > 0
+        and summary["today_confirmed_targets"] == summary["total_targets"]
+        and summary["today_remaining_targets"] == 0
+        and summary["today_warning_count"] == 0
+        and summary["orphan_history_records"] == 0
+        and summary["orphan_failure_records"] == 0
+    )
+    summary["last_confirmed_display"] = _format_short_time(summary["last_confirmed_at"], now)
+
+    return {
+        "now": now.isoformat(timespec="seconds"),
+        "nowDisplay": now.strftime("%m-%d %H:%M"),
+        "summary": summary,
+        "accounts": account_rows,
+    }
+
+
+def get_overview_snapshot(account_refs=None):
+    send_console = get_send_console_snapshot(account_refs=account_refs)
+    summary = dict(send_console["summary"])
+    accounts = []
+    for row in send_console["accounts"]:
+        accounts.append(
+            {
+                "uniqueId": row["unique_id"],
+                "displayName": row["username"],
+                "state": row["state"],
+                "total": row["total_targets"],
+                "confirmed": len(row["confirmed_targets"]),
+                "pageEcho": row["page_echo_count"],
+                "receiptOnly": row.get("receipt_only_count", 0),
+                "attention": row["attention_count"],
+                "pending": row["pending_count"],
+                "lastConfirmedAt": row["last_confirmed_at"],
+            }
+        )
+    return {
+        "now": send_console["now"],
+        "schedule": {
+            **get_schedule_snapshot(),
+            # The next cron trigger is only meaningful while something is still
+            # waiting to be sent; otherwise the window just spins empty.
+            "remainingTargets": int(summary["today_pending_targets"])
+            + int(summary["today_unprocessed_targets"]),
+            "hasWorkNextTrigger": bool(
+                int(summary["today_pending_targets"]) + int(summary["today_unprocessed_targets"])
+            ),
+        },
+        "task": task_run_lock_status(),
+        "summary": {
+            "enabledAccounts": summary["enabled_accounts"],
+            "total": summary["total_targets"],
+            "confirmed": summary["today_confirmed_targets"],
+            "pageEcho": summary["today_page_echo_targets"],
+            "receiptOnly": summary.get("today_receipt_only_targets", 0),
+            "unconfirmed": summary["today_unconfirmed_targets"],
+            "failed": summary["today_failed_targets"],
+            "blocked": summary["today_account_blocked_targets"],
+            "attention": summary["today_attention_targets"],
+            "pending": summary["today_pending_targets"],
+            "unprocessed": summary["today_unprocessed_targets"],
+            "remaining": summary["today_remaining_targets"],
+            "warnings": summary["today_warning_count"],
+            "lastConfirmedAt": summary["last_confirmed_at"],
+            "allConfirmed": summary["all_confirmed"],
+        },
+        "accounts": accounts,
+    }
+
+
+def _check_image_present():
+    """Return True if the autoflow:local image exists."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", "autoflow:local"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def log_file_path():
+    """Path of the task log the panel reads and offers for download."""
+    configured = str(get_app_settings().get("ops_log_file") or "").strip()
+    if configured:
+        return Path(configured)
+    return Path(CRON_LOG_PATH)
+
+
+LOG_LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b")
+
+# Categories that actually show up in the task log; FAILURE_CATEGORY_LABELS only
+# covers the subset the console renders, so the log summary needs its own set.
+LOG_CATEGORY_KEYS = tuple(
+    sorted(
+        set(FAILURE_CATEGORY_LABELS)
+        | {
+            "friend_index_stale",
+            "protocol_sender_failed",
+            "missing_cookies",
+            "browser_timeout",
+            "navigation_timeout",
+            "in_flight_lease_expired",
+            "unknown",
+        }
+    )
+)
+
+
+def summarize_log_tail(limit=400):
+    """Count log levels and known failure categories in the current tail."""
+    try:
+        # read_log_tail returns the tail as one string, so split it into lines
+        # before matching; iterating the string matched single characters and
+        # reported character counts instead of real levels and lines.
+        lines = (read_log_tail(limit) or "").splitlines()
+    except Exception:
+        logger.warning("summarize_log_tail could not read the log tail", exc_info=True)
+        return {"lines": 0, "levels": {}, "categories": []}
+    levels = {}
+    categories = {}
+    for line in lines:
+        match = LOG_LEVEL_RE.search(line)
+        if match:
+            level = match.group(1)
+            levels[level] = levels.get(level, 0) + 1
+        for category in LOG_CATEGORY_KEYS:
+            if category in line:
+                categories[category] = categories.get(category, 0) + 1
+    ordered = sorted(categories.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "lines": len(lines),
+        "levels": levels,
+        "categories": [
+            {
+                "category": name,
+                "label": FAILURE_CATEGORY_LABELS.get(name, name),
+                "count": count,
+            }
+            for name, count in ordered
+        ],
+    }
+
+
+def recent_trigger_lines(limit=5):
+    """Most recent scheduling-trigger log lines.
+
+    Trigger output now lands in the mounted log file, so the panel can show
+    whether the configured window actually fired instead of forcing the
+    operator onto the host shell.
+    """
+    try:
+        # read_log_tail returns the tail as one string; iterate its lines, not
+        # its characters, or every marker lookup silently finds nothing.
+        tail = (read_log_tail(400) or "").splitlines()
+    except Exception:
+        logger.warning("recent_trigger_lines could not read the log tail", exc_info=True)
+        return []
+    markers = ("AUTO_TRIGGER", "run_scheduled_task", "scheduled send", "unsent fallback")
+    hits = [line for line in tail if any(marker in line for marker in markers)]
+    return hits[-max(1, int(limit)) :]
+
+
+def _guarded_schedule_alignment(recent_triggers=None):
+    try:
+        return get_schedule_alignment(recent_triggers=recent_triggers)
+    except Exception:
+        logger.warning("get_schedule_alignment failed", exc_info=True)
+        return {
+            "windowEnabled": False,
+            "configLabel": "",
+            "fixedLabel": "",
+            "lines": [],
+            "kinds": [],
+            "aligned": False,
+            "detail": "无法读取调度状态",
+        }
+
+
+CACHE_TTL_SECONDS = 5
+_snapshot_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cached(key, producer, ttl=CACHE_TTL_SECONDS):
+    """Short-lived cache for the expensive parts of a panel snapshot.
+
+    Every dashboard render used to shell out to docker three times and read the
+    log tail more than once, which made the whole console feel sluggish.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    entry = _snapshot_cache.get(key)
+    if entry is not None and now - entry[0] < ttl:
+        return entry[1]
+    value = producer()
+    _snapshot_cache[key] = (now, value)
+    return value
+
+
+def get_ops_snapshot(account_refs=None):
+    """Collect operational metrics for the dashboard.
+
+    Every external call is individually guarded so the dashboard always
+    renders, even when Docker or crontab are not available.
+    """
+    send_console = get_send_console_snapshot(account_refs=account_refs)
+    triggers = _cached("recent-triggers", recent_trigger_lines)
+    return {
+        "compose_root": str(compose_root()),
+        "compose_file": str(compose_file_path() or ""),
+        "containers": _cached("containers", get_container_status),
+        "task_containers": _cached("task-containers", get_task_container_rows),
+        "send_console": send_console,
+        "task_lock": task_run_lock_status(),
+        "daily_schedule": current_daily_schedule(),
+        "schedule_alignment": _guarded_schedule_alignment(triggers),
+        "recent_triggers": triggers,
+        "schedule": get_schedule_snapshot(),
+        "crontab": _cached("crontab", read_crontab),
+        "log_tail": _cached("log-tail", lambda: read_log_tail(120)),
+        "image_present": _cached("image-present", _check_image_present),
+    }

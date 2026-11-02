@@ -1,0 +1,401 @@
+{% extends "base.html" %}
+
+{% block nav_key %}send_console{% endblock %}
+{% block page_key %}send-console{% endblock %}
+{% block title %}发送明细{% endblock %}
+
+{% block eyebrow %}
+<span>{{ ops.send_console.nowDisplay or "" }}</span>
+<span class="live" data-overview-live-state>实时</span>
+{% endblock %}
+{% block page_title %}发送明细{% endblock %}
+{% block page_sub %}<p class="page-sub">每个好友今天的发送结果，异常的可以单独重试。</p>{% endblock %}
+
+{% block topbar_actions %}
+{% set top_summary = ops.send_console.summary %}
+<form
+  method="post"
+  action="/ops/run-failed"
+  data-confirm-title="补发异常目标"
+  data-confirm="将补发 {{ top_summary.today_attention_targets }} 个待核验、失败或受账号异常影响的目标。确认继续吗？"
+  data-confirm-accept="开始补发"
+  data-confirm-tone="primary"
+>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button
+    class="button button-quiet"
+    type="submit"
+    data-action-count-source="attention"
+    {% if ops.task_lock.running or top_summary.today_attention_targets == 0 %}disabled{% endif %}
+  >
+    <i data-lucide="rotate-ccw"></i><span>补发异常</span><b class="count-badge" data-action-count>{{ top_summary.today_attention_targets }}</b>
+  </button>
+</form>
+<form
+  method="post"
+  action="/ops/run-unsent"
+  data-confirm-title="补发今日待发送目标"
+  data-confirm="将立即补发 {{ top_summary.today_pending_targets + top_summary.today_unprocessed_targets }} 个尚未强确认且仍可重试的目标。确认继续吗？"
+  data-confirm-accept="开始补发"
+  data-confirm-tone="primary"
+>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button
+    class="button button-primary"
+    type="submit"
+    data-action-count-source="pending"
+    {% if ops.task_lock.running or (top_summary.today_pending_targets + top_summary.today_unprocessed_targets) == 0 %}disabled{% endif %}
+  >
+    <i data-lucide="send"></i><span>补发待发送</span><b class="count-badge" data-action-count>{{ top_summary.today_pending_targets + top_summary.today_unprocessed_targets }}</b>
+  </button>
+</form>
+{% endblock %}
+
+{% block content %}
+{% set send_console = ops.send_console %}
+{% set summary = send_console.summary %}
+
+<div data-overview-root>
+  <div
+    class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"
+    data-task-banner
+  >
+    <strong>
+      <i data-lucide="{% if ops.task_lock.running %}loader-circle{% elif ops.task_lock.stale %}info{% else %}circle-check{% endif %}"></i>
+      <span data-task-text>
+        {% if ops.task_lock.running %}
+        发送任务运行中，已运行约 {{ ops.task_lock.ageSeconds }} 秒
+        {% elif ops.task_lock.stale %}
+        检测到过期任务锁，下次启动任务时会自动清理
+        {% else %}
+        当前没有发送任务运行
+        {% endif %}
+      </span>
+    </strong>
+  </div>
+
+  <div class="status-banner refresh-notice" data-refresh-notice>
+    <strong><i data-lucide="circle-check"></i><span>任务已结束，刷新后可查看最新目标级结果。</span></strong>
+    <button class="button button-quiet button-sm" type="button" data-refresh-page>
+      <i data-lucide="refresh-cw"></i><span>刷新详情</span>
+    </button>
+  </div>
+
+  <div class="callout {% if not summary.today_attention_targets %}good{% endif %}" data-today-summary>
+    <i data-lucide="{% if summary.today_attention_targets %}triangle-alert{% else %}circle-check{% endif %}"></i>
+    <p>
+      今日结论：强确认 {{ summary.today_confirmed_targets }} · 仅页面回显 {{ summary.today_page_echo_targets }} · 仅回执未确认 {{ summary.today_receipt_only_targets }} ·
+      待核验 {{ summary.today_unconfirmed_targets }} · 失败 {{ summary.today_failed_targets }} ·
+      受账号阻断 {{ summary.today_account_blocked_targets }} · 待发送 {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
+      （共 {{ summary.total_targets }} 个目标，{{ summary.enabled_accounts }} 个启用账号）
+    </p>
+  </div>
+
+  <section class="metric-grid" aria-label="发送状态汇总">
+    <article class="metric-card info">
+      <div class="metric-label">总目标</div>
+      <div class="metric-value" data-overview-value="total">{{ summary.total_targets }}</div>
+      <div class="metric-help">{{ summary.enabled_accounts }} 个启用账号</div>
+    </article>
+    <article class="metric-card success">
+      <div class="metric-label">已发送（今日）</div>
+      <div class="metric-value" data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets }}</div>
+      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 仅页面回显 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b> · 仅回执未确认 <b data-overview-value="receiptOnly">{{ summary.today_receipt_only_targets }}</b></div>
+    </article>
+    <article class="metric-card danger">
+      <div class="metric-label">需要处理</div>
+      <div class="metric-value" data-overview-value="attention">{{ summary.today_attention_targets }}</div>
+      <div class="metric-help">待核验、失败和账号阻断</div>
+    </article>
+    <article class="metric-card warning">
+      <div class="metric-label">待发送</div>
+      <div class="metric-value" data-overview-value="pending">
+        {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
+      </div>
+      <div class="metric-help">等待调度或尚未处理</div>
+    </article>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <div>
+        <h2>账号明细</h2>
+        <p>有异常的账号自动展开；成功、异常和待发送分开查看。</p>
+      </div>
+    </div>
+
+    <form class="detail-filters" method="get" action="/ops/send-console" aria-label="筛选发送明细">
+      <label class="field"><span>状态</span>
+        <select name="status">
+          <option value="all" {% if send_filters.status == 'all' %}selected{% endif %}>全部</option>
+          <option value="confirmed" {% if send_filters.status == 'confirmed' %}selected{% endif %}>已确认</option>
+          <option value="pending" {% if send_filters.status == 'pending' %}selected{% endif %}>待核验</option>
+          <option value="attention" {% if send_filters.status == 'attention' %}selected{% endif %}>失败或被拒</option>
+        </select>
+      </label>
+      <label class="field"><span>账号</span>
+        <select name="account">
+          <option value="">全部账号</option>
+          {% for filter_account in send_filters.accounts %}<option value="{{ filter_account.unique_id }}" {% if send_filters.account == filter_account.unique_id|string %}selected{% endif %}>{{ filter_account.username }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="field"><span>目标名称</span><input type="search" name="q" value="{{ send_filters.query }}" placeholder="搜索好友或群聊"></label>
+      <button class="button button-quiet button-sm" type="submit"><i data-lucide="filter"></i><span>筛选</span></button>
+    </form>
+
+    <div>
+      {% for account in send_console.accounts %}
+      {% set exception_count = account.unconfirmed_targets|length + account.failed_targets|length + account.account_blocked_targets|length %}
+      {% set success_count = account.confirmed_targets|length %}
+      {% set page_echo_count = account.page_echo_count %}
+      {% set receipt_only_count = account.receipt_only_targets|length %}
+      {% set waiting_targets = account.pending_targets + account.unprocessed_targets %}
+      {% set default_segment = "exceptions" if exception_count else ("success" if success_count else ("page_echo" if page_echo_count else ("receipt_only" if receipt_only_count else "pending"))) %}
+      <details
+        class="fold state-{{ account.state }}"
+        id="account-{{ account.unique_id }}"
+        data-segment-owner
+        data-account-overview="{{ account.unique_id }}"
+        {% if account.state in ["attention", "paused", "warning"] %}open{% endif %}
+      >
+        <summary>
+          <span class="account-ident">
+            <span class="account-avatar">{{ (account.username or "A")[:1] }}</span>
+            <span class="account-name">
+              <strong>{{ account.username }}</strong>
+              <small>{{ account.confirmed_targets|length }}/{{ account.total_targets }} 已强确认</small>
+            </span>
+          </span>
+          <span class="summary-metrics">
+            <span class="status-chip success">已确认 <b data-account-confirmed>{{ success_count }}</b></span>
+            {% if exception_count %}<span class="status-chip danger">需处理 <b data-account-attention>{{ exception_count }}</b></span>{% endif %}
+            {% if waiting_targets|length %}<span class="status-chip warning">待发送 <b data-account-pending>{{ waiting_targets|length }}</b></span>{% endif %}
+            {% if account.account_paused %}<span class="status-chip danger">账号暂停</span>{% endif %}
+            {% if account.login_verification_state == "verifying" %}<span class="status-chip">登录态验证中</span>
+            {% elif account.login_verification_state == "unverified" %}<span class="status-chip warning">登录态未能验证</span>{% endif %}
+            {% if account.identity_state == "conflict" %}<span class="status-chip danger" title="{{ account.identity_hint }}">{{ account.identity_label }}</span>
+            {% elif account.identity_state == "unverified" %}<span class="status-chip warning" title="{{ account.identity_hint }}">{{ account.identity_label }}</span>{% endif %}
+          </span>
+          <i class="fold-chevron" data-lucide="chevron-down"></i>
+        </summary>
+
+        <div class="fold-body">
+          {% if account.warnings %}
+          <div class="warning-box">
+            {% for warning in account.warnings %}<div>{{ warning.message }}</div>{% endfor %}
+          </div>
+          {% endif %}
+
+          {% if account.account_failure %}
+          <div class="danger-box">
+            <strong>账号级异常：{{ account.account_failure.category or "-" }}</strong>
+            <div>今日尝试 {{ account.account_failure.attemptCount or 0 }}/{{ account.account_failure_pause_after }} · {{ account.account_failure.reason or "-" }}</div>
+          </div>
+          {% endif %}
+
+          <div class="meta-strip">
+            <span>
+              好友索引：
+              {% if account.friend_index_meta.lastScanAt %}
+              {{ "完整" if account.friend_index_meta.lastScanComplete else "未完整" }}，记录 {{ account.friend_index_count }} 个
+              {% else %}
+              尚未扫描
+              {% endif %}
+            </span>
+            <span>最近强确认：{{ account.last_confirmed_display or "-" }}</span>
+          </div>
+
+          <div class="segmented-control" data-segment-group role="tablist" aria-label="{{ account.username }} 发送状态">
+            <button class="segment-button {% if default_segment == 'exceptions' %}active{% endif %}" type="button" data-segment-target="exceptions">
+              <i data-lucide="triangle-alert"></i><span>异常 {{ exception_count }}</span>
+            </button>
+            <button class="segment-button {% if default_segment == 'success' %}active{% endif %}" type="button" data-segment-target="success">
+              <i data-lucide="circle-check"></i><span>成功 {{ success_count }}</span>
+            </button>
+            <button class="segment-button {% if default_segment == 'page_echo' %}active{% endif %}" type="button" data-segment-target="page_echo">
+              <i data-lucide="send"></i><span>已发出·仅回显 {{ page_echo_count }}</span>
+            </button>
+            <button class="segment-button {% if default_segment == 'receipt_only' %}active{% endif %}" type="button" data-segment-target="receipt_only">
+              <i data-lucide="receipt"></i><span>已回执·未确认 {{ receipt_only_count }}</span>
+            </button>
+            <button class="segment-button {% if default_segment == 'pending' %}active{% endif %}" type="button" data-segment-target="pending">
+              <i data-lucide="clock-3"></i><span>待发送 {{ waiting_targets|length }}</span>
+            </button>
+          </div>
+
+          <div data-segment-panel="exceptions" {% if default_segment != "exceptions" %}hidden{% endif %}>
+            <div class="target-list">
+              {% for item in account.unconfirmed_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>{{ item.categoryLabel }} · 已尝试 {{ item.attemptCount or 0 }} 次</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason or item.confirmationDetail or '' }}">
+                  {{ item.reason or item.confirmationDetail or "发送结果缺少强确认" }}
+                </div>
+                <span class="target-meta">{{ item.displayLastAttemptAt or item.displaySentAt or "-" }}</span>
+                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-soft button-sm" type="submit"><i data-lucide="refresh-cw"></i><span>重试</span></button>
+                </form>
+              </article>
+              {% endfor %}
+
+              {% for item in account.failed_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>{{ item.categoryLabel }} · 已尝试 {{ item.attemptCount or 0 }} 次</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or "未记录失败原因" }}</div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
+                <span class="target-meta">{{ item.displayLastAttemptAt or "-" }}</span>
+                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-soft button-sm" type="submit"><i data-lucide="refresh-cw"></i><span>重试</span></button>
+                </form>
+              </article>
+              {% endfor %}
+
+              {% for item in account.account_blocked_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>受账号异常影响</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or item.categoryLabel }}</div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
+                <span class="target-meta">{{ item.displayLastAttemptAt or "-" }}</span>
+                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-soft button-sm" type="submit"><i data-lucide="refresh-cw"></i><span>重试</span></button>
+                </form>
+              </article>
+              {% endfor %}
+
+              {% if exception_count == 0 %}
+              <div class="empty-state">该账号今天没有待核验、失败或受阻断的目标。</div>
+              {% endif %}
+            </div>
+          </div>
+
+          <div data-segment-panel="success" {% if default_segment != "success" %}hidden{% endif %}>
+            <div class="target-list">
+              {% for item in account.confirmed_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>{{ item.confirmationLabel }}</small>
+                </div>
+                <div class="target-message" title="{{ item.message or '' }}">{{ item.message or "未保存消息正文" }}</div>
+                <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or "-" }}</span>
+                <form
+                  method="post"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  data-confirm-title="标记为待核验"
+                  data-confirm="将把“{{ item.target }}”的今日强确认记录改为待核验并加入补发队列。确认继续吗？"
+                  data-confirm-accept="标记待核验"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-ghost button-sm" type="submit"><i data-lucide="flag"></i><span>标记待核验</span></button>
+                </form>
+              </article>
+              {% else %}
+              <div class="empty-state">该账号今天还没有强确认记录。</div>
+              {% endfor %}
+            </div>
+          </div>
+
+          <div data-segment-panel="page_echo" {% if default_segment != "page_echo" %}hidden{% endif %}>
+            <div class="target-list">
+              {% for item in account.page_echo_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>{{ item.confirmationLabel }} · 已尝试 {{ item.attemptCount or 0 }} 次</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason or item.confirmationDetail or '' }}">
+                  {{ item.reason or item.confirmationDetail or "已发出，但只取得页面回显这一弱证据" }}
+                </div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
+                <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or item.displayLastAttemptAt or "-" }}</span>
+                <form
+                  method="post"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  data-confirm-title="标记为待核验并重发"
+                  data-confirm="将把“{{ item.target }}”标记为待核验并加入补发队列，今日会再发一次。确认继续吗？"
+                  data-confirm-accept="标记并重发"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-ghost button-sm" type="submit"><i data-lucide="repeat"></i><span>不确定，重发</span></button>
+                </form>
+              </article>
+              {% else %}
+              <div class="empty-state">该账号今天没有“已发出但仅页面回显”的目标。</div>
+              {% endfor %}
+            </div>
+          </div>
+
+          <div data-segment-panel="receipt_only" {% if default_segment != "receipt_only" %}hidden{% endif %}>
+            <div class="target-list">
+              {% for item in account.receipt_only_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>服务端回执成功，但页面未见新气泡 · 已尝试 {{ item.attemptCount or 0 }} 次</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason or item.confirmationDetail or '' }}">
+                  {{ item.confirmationDetail or item.reason or "服务端回执成功，但页面没有出现新的消息气泡" }}
+                </div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
+                <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or item.displayLastAttemptAt or "-" }}</span>
+                <form
+                  method="post"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  data-confirm-title="标记为待核验并重发"
+                  data-confirm="将把“{{ item.target }}”标记为待核验并加入补发队列，今日会再发一次。确认继续吗？"
+                  data-confirm-accept="标记并重发"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-ghost button-sm" type="submit"><i data-lucide="repeat"></i><span>不确定，重发</span></button>
+                </form>
+              </article>
+              {% else %}
+              <div class="empty-state">该账号今天没有“服务端回执成功但页面未见气泡”的目标。</div>
+              {% endfor %}
+            </div>
+          </div>
+
+          <div data-segment-panel="pending" {% if default_segment != "pending" %}hidden{% endif %}>
+            <div class="target-list">
+              {% for item in waiting_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>{% if item.status == "pending" %}等待计划时间{% else %}尚未处理{% endif %}</small>
+                </div>
+                <div class="target-message">好友索引：{% if item.friendIndex.seen %}已记录{% else %}尚未记录{% endif %}</div>
+                <span class="target-meta">{{ item.displayScheduledAt or "-" }}</span>
+                <span class="status-chip warning">待发送</span>
+              </article>
+              {% else %}
+              <div class="empty-state">该账号今天没有待发送目标。</div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+      </details>
+      {% else %}
+      <div class="empty-state">还没有启用的账号。</div>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

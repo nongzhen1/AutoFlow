@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cut">
+    <meta name="color-scheme" content="light dark">
+    <title>登录 · 续火花</title>
+    <script>
+      (function () {
+        var stored = null;
+        try { stored = localStorage.getItem("autoflow-theme"); } catch (e) {}
+        document.documentElement.dataset.theme = stored === "light" || stored === "dark"
+          ? stored
+          : (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/app.css?v=20261102-2">
+  </head>
+  <body data-page="login">
+    <div class="auth">
+      <aside class="auth-story">
+        <a class="brand" href="/login">
+          <span class="brand-mark"><i data-lucide="flame"></i></span>
+          <span>续火花<small>AutoFlow</small></span>
+        </a>
+        <div>
+          <h1>每天一句问候，<br><span>火花不再断。</span></h1>
+          <p>多个抖音账号的续火花都在这里：按时自动发送、确认每一条是否送达、异常的一键补发。</p>
+          <ul class="auth-features">
+            <li><i data-lucide="calendar-clock"></i><span>发送窗口内分批发送，结束后自动兜底补发</span></li>
+            <li><i data-lucide="badge-check"></i><span>服务端回执强确认，弱证据单独标出</span></li>
+            <li><i data-lucide="scan-qr-code"></i><span>网页里扫码登录，手机也能直接操作</span></li>
+          </ul>
+        </div>
+        <small class="muted">AutoFlow</small>
+      </aside>
+
+      <main class="auth-main">
+        <div class="auth-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换深浅色" title="切换深浅色">
+            <i data-lucide="moon" class="theme-light-icon"></i>
+            <i data-lucide="sun" class="theme-dark-icon"></i>
+          </button>
+        </div>
+        <section class="auth-card">
+          <h2>{% if bootstrapped %}扫码登录{% else %}先创建管理员{% endif %}</h2>
+          <p>{% if bootstrapped %}用一台已登录的手机扫描二维码，确认后当前设备即可进入控制台。{% else %}第一次使用，设置一个管理员账号和密码。{% endif %}</p>
+
+          {% if flash %}
+          <div class="flash flash-{{ flash.level }}" role="status">{{ flash.message }}</div>
+          {% endif %}
+
+          {% if not bootstrapped %}
+          <form method="post" action="/bootstrap" class="form-stack">
+            <label class="field">
+              <span>管理员用户名</span>
+              <input type="text" name="username" value="admin" autocomplete="username">
+            </label>
+            <label class="field">
+              <span>密码</span>
+              <input type="password" name="password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种">
+            </label>
+            <label class="field">
+              <span>确认密码</span>
+              <input type="password" name="confirm_password" autocomplete="new-password">
+            </label>
+            <button class="button button-primary button-block" type="submit">
+              <i data-lucide="shield-check"></i><span>创建管理员</span>
+            </button>
+          </form>
+          {% else %}
+          <div class="login-qr" data-login-qr data-token="{{ qr_poll_token }}" data-expires-in="{{ qr_expires_in }}">
+            <div class="login-qr-frame">
+              <img data-qr-image src="{{ qr_image }}" alt="扫码登录二维码" width="240" height="240">
+            </div>
+            <p class="login-qr-status" data-qr-status aria-live="polite">等待手机确认，二维码 5 分钟内有效。</p>
+            {% if qr_lan_warning %}
+            <p class="login-qr-warning" data-qr-warning>当前地址是 localhost，手机无法访问。请改用局域网或公网地址打开本页后再扫码。</p>
+            {% else %}
+            <p class="login-qr-warning" data-qr-warning hidden></p>
+            {% endif %}
+            <button class="button button-soft button-block" type="button" data-qr-refresh>
+              <i data-lucide="refresh-cw"></i><span>刷新二维码</span>
+            </button>
+            <p class="login-qr-hint">手机需已登录控制台。扫码后请在手机上点“确认登录”。</p>
+          </div>
+
+          <div class="auth-divider"><span>或</span></div>
+
+          <section class="auth-local-login">
+            <h3><i data-lucide="key-round"></i><span>本机密码登录</span></h3>
+            <p>只有一台设备、扫码不方便时，直接输入账号密码。登录后 7 天内无需重复登录。</p>
+            <form method="post" action="/login" class="form-stack">
+              <label class="field">
+                <span>用户名</span>
+                <input type="text" name="username" autocomplete="username">
+              </label>
+              <label class="field">
+                <span>密码</span>
+                <input type="password" name="password" autocomplete="current-password">
+              </label>
+              <button class="button button-primary button-block" type="submit">
+                <i data-lucide="log-in"></i><span>登录</span>
+              </button>
+            </form>
+          </section>
+          {% endif %}
+
+          <p class="auth-foot">登录页不会展示服务器凭据或任何登录态数据。</p>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      (function () {
+        var card = document.querySelector("[data-login-qr]");
+        if (!card) return;
+        var image = card.querySelector("[data-qr-image]");
+        var status = card.querySelector("[data-qr-status]");
+        var warning = card.querySelector("[data-qr-warning]");
+        var refresh = card.querySelector("[data-qr-refresh]");
+        var token = card.dataset.token;
+        var expiresAt = Date.now() + Number(card.dataset.expiresIn || 0) * 1000;
+        var timer = null;
+        var stopped = false;
+
+        function setStatus(text) { if (status) status.textContent = text; }
+        function stop() { stopped = true; if (timer) clearTimeout(timer); }
+        function remaining() { return Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000)); }
+        function schedule() { if (!stopped) timer = setTimeout(poll, 2000); }
+        function countdown() {
+          if (stopped) return;
+          if (remaining() <= 0) { stop(); setStatus("二维码已过期，请点击刷新。"); return; }
+          setStatus("等待手机确认… " + remaining() + " 秒后过期");
+        }
+        function poll() {
+          if (stopped) return;
+          fetch("/login/qr/status?token=" + encodeURIComponent(token), {
+            credentials: "same-origin", cache: "no-store", headers: { "Accept": "application/json" }
+          })
+            .then(function (response) { return response.json(); })
+            .then(function (data) {
+              if (data.status === "approved" && data.redirect) {
+                stop();
+                setStatus("登录成功，正在进入控制台…");
+                window.location.assign(data.redirect);
+                return;
+              }
+              if (data.status === "pending") { countdown(); schedule(); return; }
+              stop();
+              setStatus("二维码已失效，请点击刷新。");
+            })
+            .catch(function () { schedule(); });
+        }
+        function refreshQr() {
+          if (refresh) refresh.disabled = true;
+          fetch("/login/qr/new", {
+            method: "POST", credentials: "same-origin", cache: "no-store", headers: { "Accept": "application/json" }
+          })
+            .then(function (response) { return response.json(); })
+            .then(function (data) {
+              if (!data.token) throw new Error("missing token");
+              token = data.token;
+              expiresAt = Date.now() + Number(data.expiresIn || 0) * 1000;
+              if (image) image.src = data.qr;
+              if (warning) {
+                warning.hidden = !data.lanWarning;
+                if (data.lanWarning) {
+                  warning.textContent = "当前地址是 localhost，手机无法访问。请改用局域网或公网地址打开本页后再扫码。";
+                }
+              }
+              stopped = false;
+              countdown();
+              schedule();
+            })
+            .catch(function () { setStatus("刷新失败，请稍后重试。"); })
+            .finally(function () { if (refresh) refresh.disabled = false; });
+        }
+
+        if (refresh) refresh.addEventListener("click", refreshQr);
+        countdown();
+        poll();
+      })();
+    </script>
+    <script defer src="/static/lucide.min.js?v=20260710"></script>
+    <script defer src="/static/app.js?v=20261005-6"></script>
+  </body>
+</html>

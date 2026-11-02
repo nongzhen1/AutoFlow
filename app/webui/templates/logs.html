@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block nav_key %}logs{% endblock %}
+{% block page_key %}logs{% endblock %}
+{% block title %}运行日志{% endblock %}
+
+{% block eyebrow %}<span class="logs-meta"><span class="logs-dot" id="logs-live-dot"></span><span id="logs-status-text">最近更新：刚刚</span></span>{% endblock %}
+{% block page_title %}运行日志{% endblock %}
+{% block page_sub %}<p class="page-sub">最近 400 行任务输出：登录同步、发送过程和容器状态。</p>{% endblock %}
+
+{% block topbar_actions %}
+<button type="button" class="button button-quiet" id="logs-refresh-btn"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+<a class="button button-quiet" id="logs-download-btn" href="/ops/logs/download"><i data-lucide="download"></i><span>下载日志</span></a>
+{% endblock %}
+
+{% block content %}
+{% set has_log = log_tail and log_tail.strip() %}
+{% if (log_summary.levels or {}) or (log_summary.categories or []) %}
+<div class="logs-chips">
+  {% for level, count in (log_summary.levels or {}).items() %}
+  <span class="pill {% if level in ['ERROR', 'CRITICAL'] %}danger{% elif level == 'WARNING' %}warning{% else %}info{% endif %}">{{ level }} {{ count }}</span>
+  {% endfor %}
+  {% for item in (log_summary.categories or [])[:5] %}
+  <span class="pill warning">{{ item.label }} {{ item.count }}</span>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="logs-toolbar">
+  <div class="logs-toolbar-group">
+    <label class="toggle-switch" title="每 5 秒自动刷新日志">
+      <input type="checkbox" id="logs-autorefresh">
+      <span class="toggle-track"></span>
+      <span>自动刷新</span>
+    </label>
+    <span class="logs-meta"><span id="logs-line-count">{{ (log_tail|trim).splitlines()|length if has_log else 0 }} 行</span></span>
+  </div>
+  <input type="search" id="logs-filter" placeholder="只看包含关键字的行（分类 / 账号 / 关键字）" aria-label="过滤日志">
+</div>
+
+{# Both nodes are always rendered so a log that appears later can still be shown. #}
+<pre class="logs-code" id="logs-code" {% if not has_log %}hidden{% endif %}>{{ log_tail if has_log else "" }}</pre>
+<div class="empty-state" id="logs-empty" {% if has_log %}hidden{% endif %}>当前没有日志输出。任务运行后这里会显示最新内容。</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (() => {
+    const codeEl = document.getElementById("logs-code");
+    const emptyEl = document.getElementById("logs-empty");
+    const statusEl = document.getElementById("logs-status-text");
+    const lineEl = document.getElementById("logs-line-count");
+    const liveDot = document.getElementById("logs-live-dot");
+    const toggle = document.getElementById("logs-autorefresh");
+    const refreshBtn = document.getElementById("logs-refresh-btn");
+    const filterEl = document.getElementById("logs-filter");
+    let timer = null;
+    // Start from the server-rendered text, so filtering before the first
+    // refresh narrows the visible log instead of wiping it.
+    let rawText = codeEl ? codeEl.textContent : "";
+
+    const fmtTime = () => {
+      const d = new Date();
+      const p = (n) => String(n).padStart(2, "0");
+      return `最近更新：${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    };
+
+    const applyFilter = () => {
+      const query = String((filterEl && filterEl.value) || "").trim().toLowerCase();
+      const lines = rawText.trim() ? rawText.split(/\r?\n/) : [];
+      const shown = query ? lines.filter((line) => line.toLowerCase().includes(query)) : lines;
+      const has = lines.length > 0;
+      if (codeEl) {
+        codeEl.hidden = !has;
+        codeEl.textContent = shown.join("\n");
+      }
+      if (emptyEl) emptyEl.hidden = has;
+      if (lineEl) {
+        lineEl.textContent = query ? `显示 ${shown.length} / 共 ${lines.length} 行` : `${lines.length} 行`;
+      }
+    };
+
+    const refresh = async () => {
+      try {
+        const res = await fetch("/ops/logs", { credentials: "same-origin", headers: { Accept: "text/html" }, cache: "no-store" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+        const fetched = doc.getElementById("logs-code");
+        rawText = fetched ? fetched.textContent : "";
+        applyFilter();
+        if (statusEl) statusEl.textContent = fmtTime();
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `刷新失败：${err.message}`;
+      }
+    };
+
+    const setLive = (on) => {
+      if (liveDot) liveDot.classList.toggle("is-live", on);
+      if (timer) { clearInterval(timer); timer = null; }
+      if (on) {
+        timer = setInterval(refresh, 5000);
+        refresh();
+      }
+    };
+
+    if (toggle) toggle.addEventListener("change", () => setLive(toggle.checked));
+    if (refreshBtn) refreshBtn.addEventListener("click", refresh);
+    if (filterEl) filterEl.addEventListener("input", applyFilter);
+    if (statusEl) statusEl.textContent = fmtTime();
+  })();
+</script>
+{% endblock %}

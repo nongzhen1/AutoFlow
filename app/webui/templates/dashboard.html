@@ -1,0 +1,239 @@
+{% extends "base.html" %}
+
+{% block nav_key %}dashboard{% endblock %}
+{% block page_key %}dashboard{% endblock %}
+{% block title %}今日{% endblock %}
+
+{% set summary = ops.send_console.summary %}
+{% set total = summary.total_targets or 0 %}
+{% set strong = summary.today_confirmed_targets or 0 %}
+{% set weak = (summary.today_page_echo_targets or 0) + (summary.today_receipt_only_targets or 0) %}
+{% set sent = strong + weak %}
+{# Half-up rounding, so the server-rendered numbers match app.js Math.round(). #}
+{% set strong_pct = ((strong * 100 / total) + 0.5)|round(0, 'floor')|int if total else 0 %}
+{% set sent_pct = ((sent * 100 / total) + 0.5)|round(0, 'floor')|int if total else 0 %}
+{# The weak segment takes the rounding remainder, so the two segments always add
+   up to the displayed total and can never show more than 100%. #}
+{% set weak_pct = sent_pct - strong_pct %}
+{% set remaining = total - sent if total > sent else 0 %}
+{% set attention = summary.today_attention_targets or 0 %}
+{% set pending = (summary.today_pending_targets or 0) + (summary.today_unprocessed_targets or 0) %}
+
+{% block eyebrow %}
+<span>{{ ops.send_console.nowDisplay or "" }}</span>
+<span class="live" data-overview-live-state>实时</span>
+{% endblock %}
+
+{% block page_title %}<span data-overview-headline>{% if not total %}还没有要续的火花{% elif remaining %}今天还差 {{ remaining }} 个火花{% else %}今天的火花都续上了{% endif %}</span>{% endblock %}
+
+{% block topbar_actions %}
+<form
+  method="post"
+  action="/ops/run-failed"
+  data-confirm-title="补发异常目标"
+  data-confirm="将补发 {{ attention }} 个待核验、失败或受账号异常影响的目标。确认继续吗？"
+  data-confirm-accept="开始补发"
+  data-confirm-tone="primary"
+>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button
+    class="button button-quiet"
+    type="submit"
+    data-action-count-source="attention"
+    {% if ops.task_lock.running or attention == 0 %}disabled{% endif %}
+  >
+    <i data-lucide="rotate-ccw"></i><span>补发异常</span><b class="count-badge" data-action-count>{{ attention }}</b>
+  </button>
+</form>
+<form
+  method="post"
+  action="/ops/run-now"
+  data-confirm-title="全部重发"
+  data-confirm="这会向 {{ total }} 个目标再次发送消息，包括今天已经强确认成功的目标。确认继续吗？"
+  data-confirm-accept="确认全部重发"
+>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button
+    class="button button-primary"
+    type="submit"
+    data-disable-while-running
+    data-action-count-source="total"
+    {% if ops.task_lock.running or total == 0 %}disabled{% endif %}
+  >
+    <i data-lucide="send"></i><span>全部重发</span>
+  </button>
+</form>
+{% endblock %}
+
+{% block content %}
+<div data-overview-root>
+  <div
+    class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"
+    data-task-banner
+  >
+    <strong>
+      <i data-lucide="{% if ops.task_lock.running %}loader-circle{% else %}info{% endif %}"></i>
+      <span data-task-text>
+        {% if ops.task_lock.running %}
+        发送任务运行中，已运行约 {{ ops.task_lock.ageSeconds }} 秒
+        {% elif ops.task_lock.stale %}
+        检测到过期任务锁，下次启动任务时会自动清理
+        {% else %}
+        当前没有发送任务运行
+        {% endif %}
+      </span>
+    </strong>
+  </div>
+
+  <div class="status-banner refresh-notice" data-refresh-notice>
+    <strong><i data-lucide="circle-check"></i><span>发送任务已结束，刷新可以看到最新的账号进度。</span></strong>
+    <button class="button button-quiet button-sm" type="button" data-refresh-page>
+      <i data-lucide="refresh-cw"></i><span>刷新</span>
+    </button>
+  </div>
+
+  <section class="hero" aria-label="今日发送进度">
+    <div
+      class="progress-badge"
+      style="--strong-pct: {{ strong_pct }}%; --weak-pct: {{ weak_pct }}%"
+      data-overview-badge
+    >
+      <div>
+        <strong data-overview-value="progressPercent">{{ sent_pct }}%</strong>
+        <small>已发送</small>
+      </div>
+    </div>
+    <div>
+      <div class="hero-label"><i data-lucide="flame"></i>今天已续上</div>
+      <div class="hero-count"><span data-overview-value="progress">{{ sent }}/{{ total }}</span><small>个火花</small></div>
+      <div class="legend">
+        <span><i class="swatch swatch-strong"></i>强确认 <b data-overview-value="confirmed">{{ strong }}</b></span>
+        <span><i class="swatch swatch-weak"></i>弱证据（仅回显/仅回执） <b data-overview-value="weakSent">{{ weak }}</b></span>
+        <span><i class="swatch swatch-track"></i>待发送 <b data-overview-value="pending">{{ pending }}</b></span>
+      </div>
+      <div class="facts">
+        <div class="fact">
+          <small>下一轮</small>
+          <strong data-overview-value="nextTriggerAt">{{ ops.schedule.nextTriggerDisplay or "-" }}</strong>
+          <em data-overview-value="nextTriggerHint"></em>
+        </div>
+        <div class="fact">
+          <small>发送窗口</small>
+          <strong data-overview-value="scheduleLabel">{{ ops.schedule.label or "-" }}</strong>
+          <em>{{ summary.enabled_accounts }} 个启用账号</em>
+        </div>
+        <div class="fact">
+          <small>最近强确认</small>
+          <strong data-overview-value="lastConfirmedAt">{{ summary.last_confirmed_display or "-" }}</strong>
+          <em>服务端或协议回执</em>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="callout" style="margin-top: 18px" data-attention-callout {% if not attention %}hidden{% endif %}>
+    <i data-lucide="triangle-alert"></i>
+    <p><b><span data-overview-value="attention">{{ attention }}</span> 个目标需要处理</b> · 待核验、发送失败或受账号异常影响，可以在发送明细里逐个重试。</p>
+    <a href="/ops/send-console">去处理<i data-lucide="chevron-right"></i></a>
+  </div>
+
+  <div class="section-head">
+    <div>
+      <h2>账号</h2>
+      <p>需要处理的账号排在前面，点一下查看目标明细。</p>
+    </div>
+    <a class="section-link" href="/ops/send-console">全部明细<i data-lucide="arrow-right"></i></a>
+  </div>
+  <div class="list">
+    {% for row in ops.send_console.accounts %}
+    {% set row_total = row.total_targets or 0 %}
+    {% set row_strong = row.confirmed_targets|length %}
+    {% set row_weak = (row.page_echo_count or 0) + (row.receipt_only_count or 0) %}
+    {% set row_sent = row_strong + row_weak %}
+    {% set row_strong_pct = ((row_strong * 100 / row_total) + 0.5)|round(0, 'floor')|int if row_total else 0 %}
+    {% set row_sent_pct = ((row_sent * 100 / row_total) + 0.5)|round(0, 'floor')|int if row_total else 0 %}
+    {% set row_weak_pct = row_sent_pct - row_strong_pct %}
+    <a
+      class="account-row"
+      href="/ops/send-console#account-{{ row.unique_id }}"
+      data-account-overview="{{ row.unique_id }}"
+      data-account-state="{{ row.state }}"
+    >
+      <span class="account-ident">
+        <span class="account-avatar">{{ (row.username or "A")[:1] }}</span>
+        <span class="account-name">
+          <strong>{{ row.username }}</strong>
+          <small>
+            {% if row.login_verification_state == "verifying" %}登录态验证中 ·
+            {% elif row.login_verification_state == "unverified" %}登录态未能验证 ·
+            {% endif %}
+            {% if row.identity_state == "conflict" %}{{ row.identity_label }}：请用原账号重新扫码 ·
+            {% elif row.identity_state == "unverified" %}{{ row.identity_label }} ·
+            {% endif %}
+            {% if row.state == "paused" %}账号已暂停
+            {% elif row.state == "attention" %}有目标需要处理
+            {% elif row.state == "warning" %}存在数据警告
+            {% elif row.state == "pending" %}等待发送
+            {% else %}今日状态正常{% endif %}
+          </small>
+        </span>
+      </span>
+      <span class="progress-line">
+        <span class="progress-track">
+          <i class="progress-strong" style="width:{{ row_strong_pct }}%" data-account-progress></i>
+          <i class="progress-echo" style="width:{{ row_weak_pct }}%" data-account-progress-echo></i>
+        </span>
+        <span class="progress-text" data-account-progress-text>已发送 {{ row_sent }}/{{ row_total }} · 强确认 {{ row_strong }}</span>
+      </span>
+      <span class="row-stats">
+        <span class="pill danger" {% if not row.attention_count %}hidden{% endif %}>需处理 <b data-account-attention>{{ row.attention_count }}</b></span>
+        <span class="pill" {% if not row.pending_count %}hidden{% endif %}>待发送 <b data-account-pending>{{ row.pending_count }}</b></span>
+        <span class="pill success">强确认 <b data-account-confirmed>{{ row_strong }}</b></span>
+      </span>
+      <i class="row-chevron" data-lucide="chevron-right"></i>
+    </a>
+    {% else %}
+    <div class="empty-state">还没有启用的账号。去「登录」页扫码添加第一个抖音账号吧。</div>
+    {% endfor %}
+  </div>
+
+  {% set window_state = schedule_window_state() %}
+  {% set now_text = ops.send_console.nowDisplay or "" %}
+  {# nowDisplay ends with "HH:MM" whether or not it carries the year #}
+  {% set now_hour = now_text[-5:-3]|int if now_text[-3:-2] == ":" else -1 %}
+  {% set service_rows = (ops.containers or [])|selectattr("Names", "in", ["autoflow-web", "douyin-scheduler", "login-desktop", "mihomo"])|list %}
+  <div class="grid-2" style="margin-top: 16px">
+    <div class="card">
+      <h3 class="card-title"><i data-lucide="clock-3"></i>今日发送窗口</h3>
+      {% if window_state.enabled %}
+      <p>{{ "%02d"|format(window_state.startHour) }}:00 – {{ "%02d"|format(window_state.endHour) }}:00 之间按计划分批发送，窗口结束后兜底补发未成功的目标。</p>
+      <div class="timeline" aria-hidden="true">
+        {% for hour in range(window_state.startHour, window_state.endHour) %}
+        <span class="{% if hour < now_hour %}done{% elif hour == now_hour %}now{% endif %}" title="{{ '%02d'|format(hour) }}:00"></span>
+        {% endfor %}
+      </div>
+      <div class="timeline-labels">
+        <span>{{ "%02d"|format(window_state.startHour) }}:00</span>
+        <span>{{ "%02d"|format(window_state.endHour) }}:00</span>
+      </div>
+      {% else %}
+      <p>当前是固定时间发送：{{ ops.schedule.label or "未配置" }}。</p>
+      {% endif %}
+    </div>
+    <div class="card">
+      {% if service_rows %}
+      <h3 class="card-title"><i data-lucide="activity"></i>服务状态</h3>
+      <ul class="status-list">
+        {% set service_names = {"autoflow-web": "控制台", "douyin-scheduler": "定时调度", "login-desktop": "登录工作区", "mihomo": "备用代理"} %}
+        {% for item in service_rows %}
+        <li><span class="dot {% if item.State == 'running' %}ok{% else %}bad{% endif %}"></span>{{ service_names[item.Names] }}<span class="muted compact">{{ item.Status }}</span></li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <h3 class="card-title"><i data-lucide="sparkles"></i>小提示</h3>
+      <p>弱证据（仅回显/仅回执）表示消息大概率发出了，但没有拿到服务端的强确认；不放心可以在发送明细里标记为待核验，系统会再发一次。</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
